@@ -43,6 +43,7 @@ import io.tehred5pade.frontporch.R
 import io.tehred5pade.frontporch.ResolvedStream
 import io.tehred5pade.frontporch.resolveShortStream
 import io.tehred5pade.frontporch.ui.models.ShortItem
+import io.tehred5pade.frontporch.ui.player.KeepScreenOnEffect
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -69,6 +70,8 @@ fun ShortsScreen(
     maxStreamHeight: Int = 1080,
     preferredAudioLanguage: String = "en"
 ) {
+    KeepScreenOnEffect(keepScreenOn = isPageActive && shorts.isNotEmpty())
+
     val context = LocalContext.current
     val app = context.applicationContext as FrontPorchApp
 
@@ -249,7 +252,7 @@ fun ShortsScreen(
             isResolvingCurrent = true
             val resolved = currentShort.resolvedStream
                 ?: streamCache[currentShort.id]
-                ?: resolveShortStream(app.okHttpClient, currentShort.id, app.cachedVisitorData, maxStreamHeight).getOrNull()?.also {
+                ?: resolveShortStream(app.okHttpClient, currentShort.id, app.cachedVisitorData, maxStreamHeight, preferredAudioLanguage).getOrNull()?.also {
                     streamCache[currentShort.id] = it
                 }
 
@@ -272,7 +275,7 @@ fun ShortsScreen(
             delay(120L)
             val nextResolved = nextShort.resolvedStream
                 ?: streamCache[nextShort.id]
-                ?: resolveShortStream(app.okHttpClient, nextShort.id, app.cachedVisitorData, maxStreamHeight).getOrNull()?.also {
+                ?: resolveShortStream(app.okHttpClient, nextShort.id, app.cachedVisitorData, maxStreamHeight, preferredAudioLanguage).getOrNull()?.also {
                     streamCache[nextShort.id] = it
                 }
 
@@ -405,6 +408,7 @@ fun ShortsScreen(
             if (isCurrentPage && isPageActive) {
                 AndroidView(
                     factory = { ctx ->
+                        @Suppress("InflateParams")
                         (LayoutInflater.from(ctx).inflate(R.layout.view_shorts_player, null) as PlayerView).apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,

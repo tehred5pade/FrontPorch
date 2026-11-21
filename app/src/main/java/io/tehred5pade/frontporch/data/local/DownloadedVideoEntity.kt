@@ -22,6 +22,9 @@ interface DownloadedVideoDao {
     @Query("SELECT * FROM downloaded_videos ORDER BY downloadedAtMs DESC")
     fun observeAll(): Flow<List<DownloadedVideoEntity>>
 
+    @Query("SELECT videoId FROM downloaded_videos")
+    suspend fun getAllDownloadedVideoIds(): List<String>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(item: DownloadedVideoEntity)
 

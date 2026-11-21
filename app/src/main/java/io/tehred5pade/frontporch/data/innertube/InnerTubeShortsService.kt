@@ -41,17 +41,23 @@ class InnerTubeShortsService(
     suspend fun searchShortsByQuery(
         query: String,
         visitorData: String?,
-        paramsOverride: String? = null
+        paramsOverride: String? = null,
+        preferredAudioLanguage: String = "en"
     ): Result<List<ShortItem>> = withContext(Dispatchers.IO) {
         runCatching {
             val cleanQuery = "$query $ANTI_SLOP_OPERATORS"
+            val hlCode = if (preferredAudioLanguage.isNotBlank() && !preferredAudioLanguage.equals("auto", ignoreCase = true)) {
+                preferredAudioLanguage.lowercase()
+            } else {
+                "en"
+            }
 
             val clientObj = JSONObject().apply {
                 if (visitorData != null) put("visitorData", visitorData)
                 put("clientName", "ANDROID")
                 put("clientVersion", "20.10.38")
                 put("androidSdkVersion", 35)
-                put("hl", "en")
+                put("hl", hlCode)
                 put("gl", "US")
             }
 
@@ -110,15 +116,22 @@ class InnerTubeShortsService(
     suspend fun fetchReelSequence(
         seedVideoId: String? = null,
         continuation: String? = null,
-        visitorData: String?
+        visitorData: String?,
+        preferredAudioLanguage: String = "en"
     ): Pair<List<ShortItem>, String?> = withContext(Dispatchers.IO) {
         runCatching {
+            val hlCode = if (preferredAudioLanguage.isNotBlank() && !preferredAudioLanguage.equals("auto", ignoreCase = true)) {
+                preferredAudioLanguage.lowercase()
+            } else {
+                "en"
+            }
+
             val clientObj = JSONObject().apply {
                 if (visitorData != null) put("visitorData", visitorData)
                 put("clientName", "ANDROID")
                 put("clientVersion", "20.10.38")
                 put("androidSdkVersion", 35)
-                put("hl", "en")
+                put("hl", hlCode)
                 put("gl", "US")
             }
 

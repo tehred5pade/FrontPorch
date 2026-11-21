@@ -137,7 +137,8 @@ class MainActivity : ComponentActivity() {
         val subscriptionDao = database.subscriptionsDao()
         val shortsService = InnerTubeShortsService(app.okHttpClient)
         val cachedFeedDao = database.cachedFeedVideoDao()
-        val feedService = SubscriptionFeedService(app.okHttpClient, cachedFeedDao)
+        val downloadedDao = database.downloadedVideoDao()
+        val feedService = SubscriptionFeedService(app.okHttpClient, cachedFeedDao, downloadedDao)
         val feedCacheStore = FeedCacheStore(applicationContext)
         val watchProgressRepository = WatchProgressRepository(database.watchHistoryDao(), database.downloadedVideoDao())
 
@@ -383,7 +384,7 @@ class MainActivity : ComponentActivity() {
                     @Suppress("UNCHECKED_CAST")
                     override fun <T : ViewModel> create(modelClass: Class<T>): T {
                         return ShortsViewModel(
-                            context = context,
+                            application = app,
                             okHttpClient = app.okHttpClient,
                             shortsService = shortsService,
                             settingsRepository = settingsRepository,
@@ -508,6 +509,8 @@ class MainActivity : ComponentActivity() {
                                                 reloadTick = tabReloadTicks[AppTab.SUBSCRIPTIONS.ordinal],
                                                 downloadManager = downloadManager,
                                                 watchProgressRepository = watchProgressRepository,
+                                                hazeState = hazeState,
+                                                glassStyle = sharedGlassStyle,
                                                 onVideoClick = { video ->
                                                     openQueueVideo(
                                                         QueueVideoItem(video.videoId, video.title, video.channelName),

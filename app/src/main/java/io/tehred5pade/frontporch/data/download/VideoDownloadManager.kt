@@ -1061,7 +1061,12 @@ class VideoDownloadManager(
                     if (info.size < 0) break
 
                     info.presentationTimeUs = extractorVideo.sampleTime
-                    info.flags = extractorVideo.sampleFlags
+                    val videoSampleFlags = extractorVideo.sampleFlags
+                    info.flags = if ((videoSampleFlags and android.media.MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                        android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME
+                    } else {
+                        0
+                    }
                     lastInputTimeUs = info.presentationTimeUs
 
                     val currentSec = info.presentationTimeUs / 1_000_000f
@@ -1093,7 +1098,12 @@ class VideoDownloadManager(
                     if (info.size < 0) break
 
                     info.presentationTimeUs = extractorAudio.sampleTime
-                    info.flags = extractorAudio.sampleFlags
+                    val audioSampleFlags = extractorAudio.sampleFlags
+                    info.flags = if ((audioSampleFlags and android.media.MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                        android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME
+                    } else {
+                        0
+                    }
 
                     val currentSec = info.presentationTimeUs / 1_000_000f
                     if (skipSegments.any { currentSec >= it.startSec && currentSec < it.endSec }) {

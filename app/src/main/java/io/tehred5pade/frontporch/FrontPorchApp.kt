@@ -88,13 +88,42 @@ suspend fun fetchVisitorData(okHttpClient: OkHttpClient): String? = withContext(
     }.getOrNull()
 }
 
+private fun isTrackLanguageMatch(trackNameOrId: String, preferredAudioLanguage: String): Boolean {
+    if (preferredAudioLanguage.isBlank() || preferredAudioLanguage.equals("auto", ignoreCase = true)) return true
+    val cleanPref = preferredAudioLanguage.lowercase().trim()
+    val cleanName = trackNameOrId.lowercase().trim()
+
+    val code = cleanName.split('-', '_', '.', ' ', '(').firstOrNull().orEmpty()
+    if (code == cleanPref) return true
+    if (cleanName.startsWith(cleanPref)) return true
+
+    val langNameMap = mapOf(
+        "en" to listOf("english"),
+        "es" to listOf("spanish", "español"),
+        "fr" to listOf("french", "français"),
+        "de" to listOf("german", "deutsch"),
+        "ja" to listOf("japanese", "日本語"),
+        "ko" to listOf("korean", "한국어"),
+        "pt" to listOf("portuguese", "português"),
+        "ru" to listOf("russian", "русский"),
+        "zh" to listOf("chinese", "中文"),
+        "hi" to listOf("hindi", "हिंदी"),
+        "it" to listOf("italian", "italiano")
+    )
+
+    val names = langNameMap[cleanPref] ?: listOf(cleanPref)
+    return names.any { cleanName.contains(it) }
+}
+
 /**
  * YouTube reports per-format audio tracks (for example "English (Original)" or "French")
  * when a Short has more than one language. Block a Short when the response explicitly lists
- * audio tracks and none of them are English. When no language metadata is present we let it
- * through, so ordinary single-track Shorts are never dropped by this check.
+ * audio tracks and none of them match the preferred audio language. When no language metadata
+ * is present we let it through, so ordinary single-track Shorts are never dropped by this check.
  */
-private fun hasEnglishAudioTrack(root: JSONObject): Boolean {
+private fun hasMatchingAudioTrack(root: JSONObject, preferredAudioLanguage: String): Boolean {
+    if (preferredAudioLanguage.isBlank() || preferredAudioLanguage.equals("auto", ignoreCase = true)) return true
+
     val trackNames = mutableListOf<String>()
 
     root.optJSONObject("streamingData")?.let { streamingData ->
@@ -104,7 +133,9 @@ private fun hasEnglishAudioTrack(root: JSONObject): Boolean {
                 val format = formats.optJSONObject(i) ?: continue
                 if (!format.optString("mimeType").startsWith("audio/")) continue
                 val track = format.optJSONObject("audioTrack") ?: continue
-                val name = track.optString("displayName").ifEmpty { track.optString("locale") }
+                val name = track.optString("displayName")
+                    .ifEmpty { track.optString("locale") }
+                    .ifEmpty { track.optString("id") }
                 if (name.isNotBlank()) trackNames.add(name)
             }
         }
@@ -115,25 +146,30 @@ private fun hasEnglishAudioTrack(root: JSONObject): Boolean {
         ?.optJSONArray("audioTracks")?.let { tracks ->
             for (i in 0 until tracks.length()) {
                 val track = tracks.optJSONObject(i) ?: continue
-                val name = track.optString("displayName").ifEmpty { track.optString("languageCode") }
+                val name = track.optString("displayName")
+                    .ifEmpty { track.optString("languageCode") }
                 if (name.isNotBlank()) trackNames.add(name)
             }
         }
 
     if (trackNames.isEmpty()) return true
 
-    return trackNames.any { name ->
-        val code = name.split('-', '_', '.', ' ', '(').firstOrNull().orEmpty()
-        name.contains("english", ignoreCase = true) || code.equals("en", ignoreCase = true)
-    }
+    return trackNames.any { isTrackLanguageMatch(it, preferredAudioLanguage) }
 }
 
 suspend fun resolveShortStream(
     okHttpClient: OkHttpClient,
     videoId: String,
     visitorData: String?,
-    maxHeight: Int = 1080
+    maxHeight: Int = 1080,
+    preferredAudioLanguage: String = "en"
 ): Result<ResolvedStream> = withContext(Dispatchers.IO) {
+    val hlCode = if (preferredAudioLanguage.isNotBlank() && !preferredAudioLanguage.equals("auto", ignoreCase = true)) {
+        preferredAudioLanguage.lowercase()
+    } else {
+        "en"
+    }
+
     val clients = listOf(
         Triple("ANDROID_VR", "1.60.19", "28") to "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; Quest 3 Build/SQ3A.220605.009.A1) gzip",
         Triple("IOS", "20.10.4", "5") to "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)"
@@ -153,7 +189,7 @@ suspend fun resolveShortStream(
                   $visitorField
                   "clientName": "$clientName",
                   "clientVersion": "$clientVersion",
-                  "hl": "en",
+                  "hl": "$hlCode",
                   "gl": "US"
                 }
               }
@@ -189,8 +225,8 @@ suspend fun resolveShortStream(
             return@withContext Result.failure(Exception("Skipped AI-disclosed video"))
         }
 
-        if (!hasEnglishAudioTrack(root)) {
-            return@withContext Result.failure(Exception("Skipped non-English Short"))
+        if (!hasMatchingAudioTrack(root, preferredAudioLanguage)) {
+            return@withContext Result.failure(Exception("Skipped Short without matching language ($preferredAudioLanguage)"))
         }
 
         val streamingData = root.optJSONObject("streamingData")
@@ -222,8 +258,13 @@ suspend fun resolveShortStream(
                 var bestVideoHeight = 0
                 var smallestVideoUrl: String? = null
                 var smallestVideoHeight = Int.MAX_VALUE
-                var bestAudioUrl: String? = null
-                var bestAudioBitrate = 0
+
+                var bestMatchingAudioUrl: String? = null
+                var bestMatchingAudioBitrate = -1
+                var bestDefaultAudioUrl: String? = null
+                var bestDefaultAudioBitrate = -1
+                var bestFallbackAudioUrl: String? = null
+                var bestFallbackAudioBitrate = -1
 
                 for (i in 0 until adaptive.length()) {
                     val item = adaptive.optJSONObject(i) ?: continue
@@ -242,12 +283,36 @@ suspend fun resolveShortStream(
                         }
                     } else if (mime.startsWith("audio/mp4") && mime.contains("mp4a")) {
                         val bitrate = item.optInt("bitrate", 0)
-                        if (bitrate >= bestAudioBitrate) {
-                            bestAudioBitrate = bitrate
-                            bestAudioUrl = url
+                        val audioTrack = item.optJSONObject("audioTrack")
+                        val trackId = audioTrack?.optString("id").orEmpty()
+                        val displayName = audioTrack?.optString("displayName").orEmpty()
+                        val isDefault = audioTrack?.optBoolean("audioIsDefault") ?: false
+
+                        val isMatch = isTrackLanguageMatch(
+                            trackNameOrId = if (trackId.isNotBlank()) trackId else displayName,
+                            preferredAudioLanguage = preferredAudioLanguage
+                        )
+
+                        if (isMatch) {
+                            if (bitrate > bestMatchingAudioBitrate) {
+                                bestMatchingAudioBitrate = bitrate
+                                bestMatchingAudioUrl = url
+                            }
+                        }
+                        if (isDefault) {
+                            if (bitrate > bestDefaultAudioBitrate) {
+                                bestDefaultAudioBitrate = bitrate
+                                bestDefaultAudioUrl = url
+                            }
+                        }
+                        if (bitrate > bestFallbackAudioBitrate) {
+                            bestFallbackAudioBitrate = bitrate
+                            bestFallbackAudioUrl = url
                         }
                     }
                 }
+
+                val bestAudioUrl = bestMatchingAudioUrl ?: bestDefaultAudioUrl ?: bestFallbackAudioUrl
 
                 // If nothing fits the cap, take the smallest available variant rather than dropping the Short.
                 val videoUrl = bestVideoUrl ?: smallestVideoUrl

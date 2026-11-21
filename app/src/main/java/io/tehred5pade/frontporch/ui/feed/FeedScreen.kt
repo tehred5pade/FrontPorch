@@ -22,6 +22,7 @@ import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +35,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
 import io.tehred5pade.frontporch.FrontPorchApp
 import io.tehred5pade.frontporch.data.download.VideoDownloadManager
 import io.tehred5pade.frontporch.data.innertube.FeedVideoItem
@@ -41,6 +44,7 @@ import io.tehred5pade.frontporch.data.innertube.formatRelativeTime
 import io.tehred5pade.frontporch.data.local.WatchProgressRepository
 import io.tehred5pade.frontporch.data.playlist.PlaylistEntry
 import io.tehred5pade.frontporch.data.playlist.PlaylistStore
+import io.tehred5pade.frontporch.ui.common.frostedGlass
 import io.tehred5pade.frontporch.ui.downloads.DownloadQualityDialog
 import io.tehred5pade.frontporch.ui.playlist.PlaylistDialog
 import kotlinx.coroutines.launch
@@ -54,6 +58,8 @@ fun FeedScreen(
     reloadTick: Int = 0,
     downloadManager: VideoDownloadManager,
     watchProgressRepository: WatchProgressRepository,
+    hazeState: HazeState? = null,
+    glassStyle: HazeStyle? = null,
     onVideoClick: (FeedVideoItem) -> Unit,
     onNavigateToSettings: () -> Unit,
     topContentPadding: Dp = 0.dp,
@@ -282,13 +288,57 @@ fun FeedScreen(
                 }
             }
 
+            val pullToRefreshState = rememberPullToRefreshState()
             PullToRefreshBox(
                 isRefreshing = isRefreshing,
                 onRefresh = {
                     keepAtTop = !isScrolledDown
                     viewModel.refreshFeed()
                 },
-                modifier = Modifier.fillMaxSize()
+                state = pullToRefreshState,
+                modifier = Modifier.fillMaxSize(),
+                indicator = {
+                    if (isRefreshing || pullToRefreshState.distanceFraction > 0f) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .frostedGlass(
+                                        hazeState = hazeState,
+                                        glassStyle = glassStyle,
+                                        shape = RoundedCornerShape(32.dp),
+                                        elevation = 12.dp
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                val progress = if (isRefreshing) {
+                                    null
+                                } else {
+                                    pullToRefreshState.distanceFraction.coerceIn(0f, 1f)
+                                }
+
+                                if (progress != null) {
+                                    CircularProgressIndicator(
+                                        progress = { progress },
+                                        modifier = Modifier.size(32.dp),
+                                        strokeWidth = 3.dp,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                                    )
+                                } else {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(32.dp),
+                                        strokeWidth = 3.dp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             ) {
                 when {
                     videos.isEmpty() && isRefreshing -> {

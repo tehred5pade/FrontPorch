@@ -3,6 +3,7 @@ package io.tehred5pade.frontporch.data.innertube
 import io.tehred5pade.frontporch.data.db.SubscriptionEntity
 import io.tehred5pade.frontporch.data.local.CachedFeedVideoDao
 import io.tehred5pade.frontporch.data.local.CachedFeedVideoEntity
+import io.tehred5pade.frontporch.data.local.DownloadedVideoDao
 import io.tehred5pade.frontporch.data.local.toCachedEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -48,7 +49,8 @@ data class ChannelVideoPage(
 
 class SubscriptionFeedService(
     baseClient: OkHttpClient,
-    private val feedDao: CachedFeedVideoDao? = null
+    private val feedDao: CachedFeedVideoDao? = null,
+    private val downloadedDao: DownloadedVideoDao? = null
 ) {
     // Dedicated pooled client for the parallel XML bursts. The shared pool lets all channel
     // feeds reuse TLS connections instead of handshaking per channel.
@@ -237,9 +239,26 @@ class SubscriptionFeedService(
                             receivedAny.set(true)
                         }
 
-                        entries.isNotEmpty() -> {
+                        else -> {
                             receivedAny.set(true)
-                            buffer.addAll(entries)
+                            if (entries.isNotEmpty()) {
+                                buffer.addAll(entries)
+                            }
+
+                            if (dao != null) {
+                                val fetchedVideoIds = entries.mapTo(HashSet()) { it.videoId }
+                                if (fetchedVideoIds.isNotEmpty()) {
+                                    val existingVideoIds = dao.getVideoIdsForChannel(sub.channelId)
+                                    val removedVideoIds = existingVideoIds.filter { it !in fetchedVideoIds }
+                                    if (removedVideoIds.isNotEmpty()) {
+                                        val downloadedIds = downloadedDao?.getAllDownloadedVideoIds()?.toSet() ?: emptySet()
+                                        val toDelete = removedVideoIds.filter { it !in downloadedIds }
+                                        if (toDelete.isNotEmpty()) {
+                                            dao.deleteVideos(toDelete)
+                                        }
+                                    }
+                                }
+                            }
 
                             // Flush the first batch quickly so Room can render the newest
                             // videos before slower channels have finished.

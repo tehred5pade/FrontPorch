@@ -1,7 +1,8 @@
 package io.tehred5pade.frontporch.ui.shorts
 
+import android.app.Application
 import android.content.Context
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.tehred5pade.frontporch.data.db.SubscriptionDao
 import io.tehred5pade.frontporch.data.innertube.InnerTubeShortsService
@@ -25,12 +26,15 @@ import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 
 class ShortsViewModel(
-    private val context: Context,
+    application: Application,
     private val okHttpClient: OkHttpClient,
     private val shortsService: InnerTubeShortsService,
     private val settingsRepository: UserSettingsRepository,
     private val subscriptionDao: SubscriptionDao
-) : ViewModel() {
+) : AndroidViewModel(application) {
+
+    private val context: Context
+        get() = getApplication<Application>()
 
     private val userSettings: StateFlow<UserSettings> = settingsRepository.settingsFlow.stateIn(
         scope = viewModelScope,
@@ -103,7 +107,8 @@ class ShortsViewModel(
             val (moreItems, nextToken) = shortsService.fetchReelSequence(
                 seedVideoId = if (continuationToken == null) seedId else null,
                 continuation = continuationToken,
-                visitorData = visitorData
+                visitorData = visitorData,
+                preferredAudioLanguage = userSettings.value.preferredAudioLanguage
             )
 
             continuationToken = nextToken
@@ -127,13 +132,14 @@ class ShortsViewModel(
     ): List<ShortItem> = coroutineScope {
         val semaphore = Semaphore(6)
         val maxHeight = context.currentStreamMaxHeight(userSettings.value)
+        val prefLang = userSettings.value.preferredAudioLanguage
         // Skip anything already known to resolve into a blank/black player so a broken
         // Short never reappears when a later batch or refresh pulls it in again.
         candidates.filterNot { it.id in blockedShortIds }.map { item ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
                     val stream = item.resolvedStream
-                        ?: resolveShortStream(okHttpClient, item.id, visitorData, maxHeight).getOrNull()
+                        ?: resolveShortStream(okHttpClient, item.id, visitorData, maxHeight, prefLang).getOrNull()
                     if (stream != null) item.copy(resolvedStream = stream) else null
                 }
             }
@@ -269,7 +275,12 @@ class ShortsViewModel(
         val searchResults = queries
             .map { query ->
                 async {
-                    shortsService.searchShortsByQuery(query, visitorData, sortParam)
+                    shortsService.searchShortsByQuery(
+                        query = query,
+                        visitorData = visitorData,
+                        paramsOverride = sortParam,
+                        preferredAudioLanguage = userSettings.value.preferredAudioLanguage
+                    )
                         .onFailure { _errorMessage.value = it.message }
                         .getOrDefault(emptyList())
                 }
@@ -285,7 +296,8 @@ class ShortsViewModel(
         val results = if (seedId != null) {
             val (reelItems, nextToken) = shortsService.fetchReelSequence(
                 seedVideoId = seedId,
-                visitorData = visitorData
+                visitorData = visitorData,
+                preferredAudioLanguage = userSettings.value.preferredAudioLanguage
             )
             continuationToken = nextToken
             (filtered + reelItems).distinctBy { it.id }

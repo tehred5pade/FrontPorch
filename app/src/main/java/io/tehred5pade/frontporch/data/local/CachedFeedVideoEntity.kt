@@ -35,6 +35,9 @@ interface CachedFeedVideoDao {
     @Query("SELECT COUNT(*) > 0 FROM cached_feed_videos WHERE channelId = :channelId")
     suspend fun hasVideosForChannel(channelId: String): Boolean
 
+    @Query("SELECT videoId FROM cached_feed_videos WHERE channelId = :channelId")
+    suspend fun getVideoIdsForChannel(channelId: String): List<String>
+
     @Query("SELECT durationSeconds FROM cached_feed_videos WHERE videoId = :videoId LIMIT 1")
     suspend fun getDurationForVideo(videoId: String): Int?
 
