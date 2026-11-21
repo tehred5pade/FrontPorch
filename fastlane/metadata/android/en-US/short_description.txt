@@ -1,0 +1,1 @@
+Privacy-focused, ad-free YouTube client with SponsorBlock and offline downloads.
