@@ -5,15 +5,15 @@ plugins {
 }
 
 android {
-    namespace = "com.example.frontporch"
+    namespace = "io.tehred5pade.frontporch"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.example.frontporch"
+        applicationId = "io.tehred5pade.frontporch"
         minSdk = 36
         targetSdk = 37
         versionCode = 1
-        versionName = "1.0"
+        versionName = "0.01"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
