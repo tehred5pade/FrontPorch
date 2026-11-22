@@ -5,6 +5,10 @@ plugins {
 }
 
 android {
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
     namespace = "io.tehred5pade.frontporch"
     compileSdk = 37
 
