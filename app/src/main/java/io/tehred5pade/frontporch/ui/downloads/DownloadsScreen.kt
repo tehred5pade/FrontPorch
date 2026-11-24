@@ -3,6 +3,8 @@ package io.tehred5pade.frontporch.ui.downloads
 import android.content.res.Configuration
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.view.LayoutInflater
+import io.tehred5pade.frontporch.R
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -69,7 +71,10 @@ import io.tehred5pade.frontporch.data.local.WatchProgressRepository
 import io.tehred5pade.frontporch.data.playlist.PlaylistEntry
 import io.tehred5pade.frontporch.data.playlist.PlaylistStore
 import io.tehred5pade.frontporch.ui.common.InlineMenu
+import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockRepository
+import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
+import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.service.PlaybackSessionHolder
 import io.tehred5pade.frontporch.ui.feed.DurationBadge
 import io.tehred5pade.frontporch.ui.feed.WatchProgressBar
@@ -221,6 +226,8 @@ fun DownloadsScreen(
             store = playlistStore,
             okHttpClient = okHttpClient,
             entry = playlistDialogEntry,
+            hazeState = hazeState,
+            glassStyle = glassStyle,
             onPlayEntry = onPlayPlaylistEntry,
             onDismiss = {
                 showPlaylistDialog = false
@@ -403,6 +410,8 @@ fun DownloadsScreen(
                             isSelectionMode = isSelectionMode,
                             isSelected = item.videoId in selectedVideoIds,
                             isMenuExpanded = menuExpandedForId == item.videoId,
+                            hazeState = hazeState,
+                            glassStyle = glassStyle,
                             onClick = {
                                 if (isSelectionMode) {
                                     if (item.videoId in selectedVideoIds) {
@@ -479,6 +488,8 @@ fun DownloadsScreen(
                             isSelectionMode = isSelectionMode,
                             isSelected = item.videoId in selectedVideoIds,
                             isMenuExpanded = menuExpandedForId == item.videoId,
+                            hazeState = hazeState,
+                            glassStyle = glassStyle,
                             onClick = {
                                 if (isSelectionMode) {
                                     if (item.videoId in selectedVideoIds) {
@@ -523,14 +534,20 @@ fun DownloadsScreen(
         }
 
         if (isSelectionMode) {
+            val selectionBarShape = RoundedCornerShape(18.dp)
             Surface(
-                color = scheme.surfaceContainerHigh,
-                shape = RoundedCornerShape(18.dp),
-                shadowElevation = 10.dp,
+                color = Color.Transparent,
+                shape = selectionBarShape,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = bottomContentPadding)
                     .padding(horizontal = 16.dp)
+                    .frostedGlass(
+                        hazeState = hazeState,
+                        glassStyle = glassStyle,
+                        shape = selectionBarShape,
+                        elevation = 10.dp
+                    )
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -570,9 +587,10 @@ fun DownloadsScreen(
                     }
                 }
             }
-        } else if (sortedDownloads.isNotEmpty()) {
+        } else if (sortedDownloads.isNotEmpty() || playlistStore != null) {
             // Sort + playlist pill pinned top-right, using the exact same frosted
-            // glass recipe as the tab bar.
+            // glass recipe as the tab bar. The playlists action must stay available
+            // even with no downloads so playlists can always be browsed/managed.
             Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -591,64 +609,70 @@ fun DownloadsScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.padding(horizontal = 2.dp)
                 ) {
-                    IconButton(
-                        onClick = { internalSortNewestFirst = !internalSortNewestFirst },
-                        modifier = Modifier.size(44.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Sort,
-                            contentDescription = if (internalSortNewestFirst) "Sorted Newest First" else "Sorted Oldest First",
-                            tint = scheme.onSurface,
-                            modifier = Modifier.size(22.dp)
+                    if (sortedDownloads.isNotEmpty()) {
+                        IconButton(
+                            onClick = { internalSortNewestFirst = !internalSortNewestFirst },
+                            modifier = Modifier.size(44.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Sort,
+                                contentDescription = if (internalSortNewestFirst) "Sorted Newest First" else "Sorted Oldest First",
+                                tint = scheme.onSurface,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .size(width = 1.dp, height = 24.dp)
+                                .background(scheme.onSurface.copy(alpha = 0.12f))
                         )
                     }
 
-                    Box(
-                        modifier = Modifier
-                            .size(width = 1.dp, height = 24.dp)
-                            .background(scheme.onSurface.copy(alpha = 0.12f))
-                    )
-
-                    IconButton(
-                        onClick = { showPlaylistDialog = true },
-                        modifier = Modifier.size(44.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
-                            contentDescription = "Playlists",
-                            tint = scheme.onSurface,
-                            modifier = Modifier.size(24.dp)
-                        )
+                    if (playlistStore != null) {
+                        IconButton(
+                            onClick = { showPlaylistDialog = true },
+                            modifier = Modifier.size(44.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                contentDescription = "Playlists",
+                                tint = scheme.onSurface,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
                     }
                 }
             }
 
             // Squircle Play button, sharing the tab bar's frost recipe.
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(
-                        end = if (isLandscape) 96.dp else 16.dp,
-                        bottom = if (isLandscape) 16.dp else bottomContentPadding
+            if (sortedDownloads.isNotEmpty()) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(
+                            end = if (isLandscape) 96.dp else 16.dp,
+                            bottom = if (isLandscape) 16.dp else bottomContentPadding
+                        )
+                        .size(56.dp)
+                        .frostedGlass(
+                            hazeState = hazeState,
+                            glassStyle = glassStyle,
+                            shape = RoundedCornerShape(24.dp)
+                        )
+                        .clickable {
+                            activePlaylist = sortedDownloads.toList()
+                            activePlaylistStartIndex = 0
+                        }
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.PlayArrow,
+                        contentDescription = "Play All",
+                        tint = scheme.onSurface,
+                        modifier = Modifier.size(28.dp)
                     )
-                    .size(56.dp)
-                    .frostedGlass(
-                        hazeState = hazeState,
-                        glassStyle = glassStyle,
-                        shape = RoundedCornerShape(24.dp)
-                    )
-                    .clickable {
-                        activePlaylist = sortedDownloads.toList()
-                        activePlaylistStartIndex = 0
-                    }
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.PlayArrow,
-                    contentDescription = "Play All",
-                    tint = scheme.onSurface,
-                    modifier = Modifier.size(28.dp)
-                )
+                }
             }
         }
     }
@@ -662,6 +686,8 @@ private fun DownloadedVideoRow(
     isSelectionMode: Boolean,
     isSelected: Boolean,
     isMenuExpanded: Boolean,
+    hazeState: HazeState? = null,
+    glassStyle: HazeStyle? = null,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     onSelect: () -> Unit,
@@ -899,10 +925,33 @@ fun OfflineVideoPlayer(
         }
     }
 
-    // Poll progress and trigger the watched checkmark as soon as >= 90% of the video has played
-    LaunchedEffect(exoPlayer, currentVideo.videoId) {
+    val sponsorBlockEnabled by SponsorBlockPreferences.isEnabled.collectAsState()
+    val categoryBehaviors by SponsorBlockPreferences.categoryBehaviors.collectAsState()
+    var rawOfflineSegments by remember(currentVideo.videoId) { mutableStateOf<List<SponsorSegment>>(emptyList()) }
+    val skippedOfflineUuids = remember(currentVideo.videoId) { mutableStateListOf<String>() }
+    var offlineSkipBannerText by remember(currentVideo.videoId) { mutableStateOf<String?>(null) }
+
+    val activeOfflineSegments = remember(rawOfflineSegments, categoryBehaviors, sponsorBlockEnabled) {
+        if (!sponsorBlockEnabled) emptyList()
+        else rawOfflineSegments.filter { seg ->
+            (categoryBehaviors[seg.category] ?: seg.category.defaultBehavior) != SponsorSkipBehavior.NOTHING
+        }
+    }
+
+    LaunchedEffect(currentVideo.videoId, sponsorBlockEnabled) {
+        skippedOfflineUuids.clear()
+        offlineSkipBannerText = null
+        rawOfflineSegments = if (sponsorBlockEnabled) {
+            sponsorBlockRepo.getSegments(currentVideo.videoId)
+        } else {
+            emptyList()
+        }
+    }
+
+    // Poll progress, skip sponsor segments, and trigger the watched checkmark
+    LaunchedEffect(exoPlayer, currentVideo.videoId, activeOfflineSegments, categoryBehaviors, sponsorBlockEnabled) {
         while (true) {
-            delay(500L)
+            delay(200L)
             val posMs = exoPlayer.currentPosition.coerceAtLeast(0L)
             val durMs = exoPlayer.duration.takeIf { it > 0L } ?: (currentVideo.durationSeconds.toLong() * 1000L)
             currentSeconds = posMs / 1000L
@@ -910,6 +959,27 @@ fun OfflineVideoPlayer(
 
             if (!isScrubbing && durMs > 0L) {
                 scrubFraction = (posMs.toFloat() / durMs.toFloat()).coerceIn(0f, 1f)
+            }
+
+            if (sponsorBlockEnabled && activeOfflineSegments.isNotEmpty()) {
+                val currentSec = posMs / 1000f
+                val autoHit = activeOfflineSegments.firstOrNull { seg ->
+                    val mode = categoryBehaviors[seg.category] ?: seg.category.defaultBehavior
+                    mode == SponsorSkipBehavior.AUTO_SKIP &&
+                        seg.actionType == "skip" &&
+                        seg.uuid !in skippedOfflineUuids &&
+                        currentSec >= (seg.startSec - 0.25f) &&
+                        currentSec < (seg.endSec - 0.10f)
+                }
+
+                if (autoHit != null) {
+                    skippedOfflineUuids.add(autoHit.uuid)
+                    val totalDurSec = durMs / 1000f
+                    val isEndOfVideo = totalDurSec > 0f && autoHit.endSec >= (totalDurSec - 0.75f)
+                    val targetMs = if (isEndOfVideo) durMs else (autoHit.endSec * 1000f).toLong()
+                    exoPlayer.seekTo(targetMs)
+                    offlineSkipBannerText = "Skipped ${autoHit.category.title}"
+                }
             }
 
             if (durMs > 0L &&
@@ -926,6 +996,13 @@ fun OfflineVideoPlayer(
                 hasPrevious = currentIndex > 0,
                 hasNext = currentIndex < playlist.lastIndex
             )
+        }
+    }
+
+    LaunchedEffect(offlineSkipBannerText) {
+        if (offlineSkipBannerText != null) {
+            delay(2200L)
+            offlineSkipBannerText = null
         }
     }
 
@@ -960,7 +1037,7 @@ fun OfflineVideoPlayer(
     ) {
         AndroidView(
             factory = { ctx ->
-                PlayerView(ctx).apply {
+                (LayoutInflater.from(ctx).inflate(R.layout.view_video_player, null) as PlayerView).apply {
                     player = exoPlayer
                     useController = false
                     keepScreenOn = true
@@ -1084,7 +1161,7 @@ fun OfflineVideoPlayer(
                         SegmentedDotScrubber(
                             value = scrubFraction,
                             durationSeconds = durationSeconds,
-                            sponsorSegments = emptyList(),
+                            sponsorSegments = activeOfflineSegments,
                             onValueChange = { newVal: Float ->
                                 isScrubbing = true
                                 scrubFraction = newVal

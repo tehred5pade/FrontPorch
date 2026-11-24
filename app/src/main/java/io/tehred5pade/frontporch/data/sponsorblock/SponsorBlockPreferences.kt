@@ -72,7 +72,7 @@ enum class SponsorCategory(
         title = "Filler Tangent / Jokes",
         description = "Tangential jokes or scenes added only for filler",
         badgeColor = Color(0xFF7300FF),
-        defaultBehavior = SponsorSkipBehavior.NOTHING
+        defaultBehavior = SponsorSkipBehavior.AUTO_SKIP
     ),
     POI_HIGHLIGHT(
         apiKey = "poi_highlight",
@@ -86,7 +86,7 @@ enum class SponsorCategory(
         title = "Exclusive Access",
         description = "Videos showcasing free or early-access products/services",
         badgeColor = Color(0xFF008A5C),
-        defaultBehavior = SponsorSkipBehavior.NOTHING
+        defaultBehavior = SponsorSkipBehavior.AUTO_SKIP
     );
 
     companion object {

@@ -48,8 +48,11 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
 import io.tehred5pade.frontporch.data.playlist.PlaylistEntry
 import io.tehred5pade.frontporch.data.playlist.PlaylistStore
+import io.tehred5pade.frontporch.ui.common.frostedGlass
 import io.tehred5pade.frontporch.ui.feed.YouTubeThumbnail
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -66,6 +69,8 @@ fun PlaylistDialog(
     store: PlaylistStore,
     okHttpClient: OkHttpClient,
     entry: PlaylistEntry?,
+    hazeState: HazeState? = null,
+    glassStyle: HazeStyle? = null,
     onPlayEntry: (PlaylistEntry) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -80,8 +85,17 @@ fun PlaylistDialog(
         onDismiss()
     }
 
+    val dialogShape = RoundedCornerShape(28.dp)
     AlertDialog(
         onDismissRequest = onDismiss,
+        modifier = Modifier.frostedGlass(
+            hazeState = hazeState,
+            glassStyle = glassStyle,
+            shape = dialogShape,
+            elevation = 10.dp
+        ),
+        shape = dialogShape,
+        containerColor = Color.Transparent,
         title = {
             Text(
                 text = if (entry == null) "Playlists" else "Add to playlist",

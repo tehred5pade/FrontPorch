@@ -32,7 +32,8 @@ data class FullVideoDetails(
     val publishDate: String,
     val description: String,
     val resolvedVisitorData: String?,
-    val candidates: List<PlayableCandidate>
+    val candidates: List<PlayableCandidate>,
+    val captions: List<CaptionTrack> = emptyList()
 )
 
 class InnerTubeVideoService(
@@ -125,6 +126,7 @@ class InnerTubeVideoService(
         var viewCount = ""
         var publishDate = ""
         var description = ""
+        var captions: List<CaptionTrack> = emptyList()
         val candidates = mutableListOf<PlayableCandidate>()
         val errors = mutableListOf<String>()
 
@@ -151,6 +153,7 @@ class InnerTubeVideoService(
                 publishDate = meta.publishDate
                 description = meta.description
             }
+            captions = parseCaptionTracks(root)
             root.optJSONObject("streamingData")?.let { sd ->
                 val hlsUrl = sd.optString("hlsManifestUrl")
                 if (hlsUrl.isNotEmpty()) {
@@ -188,6 +191,7 @@ class InnerTubeVideoService(
                         description = meta.description
                     }
                 }
+                if (captions.isEmpty()) captions = parseCaptionTracks(root)
                 root.optJSONObject("streamingData")?.let { sd ->
                     parseAdaptiveStream(sd)?.let {
                         candidates.add(PlayableCandidate(it, vrUserAgent, "ANDROID_VR-adaptive"))
@@ -202,6 +206,13 @@ class InnerTubeVideoService(
             }
         }
 
+        // Some videos fail stream resolution (and fall back to the WebView player) while
+        // still exposing perfectly good caption tracks through the IOS/VR player endpoint.
+        // Fetch them separately so CC works in both playback paths.
+        if (captions.isEmpty()) {
+            captions = fetchCaptionTracksOnly(videoId)
+        }
+
         if (candidates.isEmpty()) {
             Result.failure(Exception(errors.joinToString(" | ").ifEmpty { "LOGIN_REQUIRED" }))
         } else {
@@ -214,11 +225,61 @@ class InnerTubeVideoService(
                     publishDate = publishDate,
                     description = description,
                     resolvedVisitorData = activeVisitor,
-                    candidates = candidates
+                    candidates = candidates,
+                    captions = captions
                 )
             )
         }
     }
+
+    /**
+     * Caption-only lookup that does not depend on stream resolution succeeding. Tries the
+     * same mobile clients used for playback but without the scraped visitor token/cookie,
+     * which can make the player endpoint reject an otherwise playable video.
+     */
+    suspend fun fetchCaptionTracksOnly(videoId: String): List<CaptionTrack> = withContext(Dispatchers.IO) {
+        val clients = listOf(
+            CaptionClient("IOS", "20.10.4", "5", iosUserAgent),
+            CaptionClient("ANDROID_VR", "1.61.48", "28", vrUserAgent)
+        )
+        for (client in clients) {
+            val root = queryPlayerClient(
+                videoId = videoId,
+                visitorData = null,
+                cookieHeader = null,
+                clientName = client.name,
+                clientVersion = client.version,
+                clientId = client.id,
+                userAgent = client.userAgent
+            ).getOrNull() ?: continue
+
+            val tracks = parseCaptionTracks(root)
+            if (tracks.isNotEmpty()) return@withContext tracks
+        }
+        emptyList()
+    }
+
+    /** Downloads the WebVTT body for a parsed caption track. */
+    suspend fun fetchCaptionVtt(caption: CaptionTrack): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val request = Request.Builder()
+                .url(caption.url)
+                .header("User-Agent", iosUserAgent)
+                .header("Referer", "https://www.youtube.com/")
+                .get()
+                .build()
+            okHttpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) null else response.body?.string()
+            }
+        }.getOrNull()
+    }
+
+    private data class CaptionClient(
+        val name: String,
+        val version: String,
+        val id: String,
+        val userAgent: String
+    )
 
     suspend fun fetchVideoComments(
         videoId: String,

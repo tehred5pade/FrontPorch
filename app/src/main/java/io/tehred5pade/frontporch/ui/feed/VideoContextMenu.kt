@@ -16,9 +16,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
+import io.tehred5pade.frontporch.ui.common.frostedGlass
 
 enum class VideoMenuAction(val label: String, val icon: ImageVector) {
     BACKGROUND("Play in background (audio stream)", Icons.Outlined.Headphones),
@@ -30,25 +34,34 @@ enum class VideoMenuAction(val label: String, val icon: ImageVector) {
 }
 
 /**
- * Single, non-scrolling action menu drawn inside the video card. It stays next to
- * the video and, unlike a platform popup window, participates in the app's back chain.
+ * Single, non-scrolling action menu. It is hosted in its own (Haze-aware) dialog so
+ * its scrim is not captured by the feed's hazeSource, and it uses the exact same
+ * frosted-glass recipe as the tab bar.
  */
 @Composable
 fun VideoOptionsPopup(
     expanded: Boolean,
     onDismiss: () -> Unit,
-    onActionSelected: (VideoMenuAction) -> Unit
+    onActionSelected: (VideoMenuAction) -> Unit,
+    hazeState: HazeState? = null,
+    glassStyle: HazeStyle? = null
 ) {
     if (!expanded) return
 
     BackHandler { onDismiss() }
 
+    val menuShape = RoundedCornerShape(12.dp)
     Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        tonalElevation = 3.dp,
-        shadowElevation = 8.dp,
-        modifier = Modifier.width(244.dp)
+        shape = menuShape,
+        color = Color.Transparent,
+        modifier = Modifier
+            .width(244.dp)
+            .frostedGlass(
+                hazeState = hazeState,
+                glassStyle = glassStyle,
+                shape = menuShape,
+                elevation = 10.dp
+            )
     ) {
         Column {
             VideoMenuAction.entries.forEach { action ->
@@ -57,6 +70,7 @@ fun VideoOptionsPopup(
                         Text(
                             text = action.label,
                             style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )

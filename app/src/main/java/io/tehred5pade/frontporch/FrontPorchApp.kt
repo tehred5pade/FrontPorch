@@ -6,23 +6,46 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.Log
 import io.tehred5pade.frontporch.data.download.VideoDownloadManager
+import io.tehred5pade.frontporch.data.innertube.CaptionTrack
+import io.tehred5pade.frontporch.data.innertube.parseCaptionTracks
 import io.tehred5pade.frontporch.data.local.FrontPorchDatabase
 import io.tehred5pade.frontporch.data.prefs.UserSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 sealed interface ResolvedStream {
     data class Single(val url: String) : ResolvedStream
     data class Adaptive(val videoUrl: String, val audioUrl: String) : ResolvedStream
 }
 
+/** A resolved stream together with caption tracks and the creator's channel identity. */
+data class ResolvedShortStream(
+    val stream: ResolvedStream,
+    val captions: List<CaptionTrack> = emptyList(),
+    val channelId: String = "",
+    val channelTitle: String = ""
+)
+
 class FrontPorchApp : Application() {
-    val okHttpClient = OkHttpClient.Builder().build()
+    val okHttpClient = OkHttpClient.Builder()
+        .connectionPool(ConnectionPool(32, 5, TimeUnit.MINUTES))
+        // Parallel ranged chunk downloads issue several requests to the same media host at
+        // once. OkHttp's default dispatcher allows only 5 per host, which would queue them.
+        .dispatcher(okhttp3.Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 24
+        })
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
     var cachedVisitorData: String? = null
 
     val downloadManager by lazy {
@@ -48,28 +71,90 @@ class FrontPorchApp : Application() {
     }
 }
 
-private fun Context.isUnmeteredConnection(): Boolean {
+private fun Context.activeNetworkCapabilities(): NetworkCapabilities? {
     val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-    val network = manager?.activeNetwork
-    val capabilities = network?.let { manager.getNetworkCapabilities(it) }
+    val network = manager?.activeNetwork ?: return null
+    return manager.getNetworkCapabilities(network)
+}
+
+private fun Context.isUnmeteredConnection(): Boolean {
+    val capabilities = activeNetworkCapabilities()
     return capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true ||
         capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true ||
         capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true
 }
 
+private data class AutoStreamQuality(val maxHeight: Int, val targetFps: Int)
+
 /**
- * Caps Shorts stream resolution to what the current connection can handle. Wi-Fi / Ethernet
- * (or any unmetered connection) uses the user's high cap; cellular uses the mobile cap.
+ * Auto is stream-only. It starts from the current link's estimated downstream bandwidth and
+ * picks a lower resolution/frame rate when the connection is slow so playback can continue
+ * instead of buffering on a high-bitrate variant. Unknown/zero bandwidth keeps the best cap.
  */
-fun Context.currentStreamMaxHeight(settings: UserSettings): Int =
-    if (isUnmeteredConnection()) settings.wifiStreamMaxHeight else settings.mobileStreamMaxHeight
+private fun Context.autoStreamQuality(allowHighRes: Boolean): AutoStreamQuality {
+    val kbps = activeNetworkCapabilities()?.getLinkDownstreamBandwidthKbps() ?: 0
+    val (preferredHeight, preferredFps) = when {
+        kbps <= 0 -> if (allowHighRes) 4320 to 0 else 1080 to 0
+        kbps < 1_000 -> 240 to 30
+        kbps < 2_000 -> 360 to 30
+        kbps < 4_000 -> 480 to 30
+        kbps < 8_000 -> 720 to 30
+        kbps < 20_000 -> 1080 to 0
+        kbps < 45_000 -> 1440 to 60
+        else -> 2160 to 60
+    }
+    val maxHeight = if (allowHighRes) preferredHeight else minOf(preferredHeight, 1080)
+    val targetFps = if (maxHeight < 720 && preferredFps == 0) 30 else preferredFps
+    return AutoStreamQuality(maxHeight, targetFps)
+}
+
+/** Caps Shorts stream resolution to what the current connection can handle. */
+fun Context.currentStreamMaxHeight(settings: UserSettings): Int {
+    val configured = if (isUnmeteredConnection()) {
+        settings.wifiStreamMaxHeight
+    } else {
+        settings.mobileStreamMaxHeight
+    }
+    // Height 0 is the stream-only Auto option.
+    if (configured <= 0) return autoStreamQuality(settings.allowHighResContent).maxHeight
+    return if (settings.allowHighResContent) configured else minOf(configured, 1080)
+}
+
+/** Preferred frame rate for Shorts on the current connection (0 means no explicit preference). */
+fun Context.currentStreamTargetFps(settings: UserSettings): Int {
+    val configuredHeight = if (isUnmeteredConnection()) {
+        settings.wifiStreamMaxHeight
+    } else {
+        settings.mobileStreamMaxHeight
+    }
+    if (configuredHeight <= 0) return autoStreamQuality(settings.allowHighResContent).targetFps
+    return if (isUnmeteredConnection()) settings.wifiStreamTargetFps else settings.mobileStreamTargetFps
+}
 
 /**
  * Caps downloads to the quality the user chose in Settings for the current connection.
  * Wi-Fi / Ethernet (or any unmetered connection) uses the high cap; cellular uses the mobile cap.
  */
-fun Context.currentDownloadMaxHeight(settings: UserSettings): Int =
-    if (isUnmeteredConnection()) settings.wifiDownloadMaxHeight else settings.mobileDownloadMaxHeight
+fun Context.currentDownloadMaxHeight(settings: UserSettings): Int {
+    val configured = if (isUnmeteredConnection()) {
+        settings.wifiDownloadMaxHeight
+    } else {
+        settings.mobileDownloadMaxHeight
+    }
+    val safe = if (configured <= 0) 1080 else configured
+    return if (settings.allowHighResContent) safe else minOf(safe, 1080)
+}
+
+/** Download FPS follows the Settings dropdown; Auto is never part of the download options. */
+fun Context.currentDownloadTargetFps(settings: UserSettings): Int {
+    val configuredHeight = if (isUnmeteredConnection()) {
+        settings.wifiDownloadMaxHeight
+    } else {
+        settings.mobileDownloadMaxHeight
+    }
+    if (configuredHeight <= 0) return 0
+    return if (isUnmeteredConnection()) settings.wifiDownloadTargetFps else settings.mobileDownloadTargetFps
+}
 
 suspend fun fetchVisitorData(okHttpClient: OkHttpClient): String? = withContext(Dispatchers.IO) {
     runCatching {
@@ -116,54 +201,21 @@ private fun isTrackLanguageMatch(trackNameOrId: String, preferredAudioLanguage: 
 }
 
 /**
- * YouTube reports per-format audio tracks (for example "English (Original)" or "French")
- * when a Short has more than one language. Block a Short when the response explicitly lists
- * audio tracks and none of them match the preferred audio language. When no language metadata
- * is present we let it through, so ordinary single-track Shorts are never dropped by this check.
+ * ExoPlayer already applies the user's preferred audio language through
+ * `trackSelectionParameters`. Rejecting an otherwise playable Short here just because
+ * YouTube labels its audio tracks differently was a frequent cause of shorts failing to
+ * load and being auto-skipped, so resolution never fails on language metadata alone.
  */
-private fun hasMatchingAudioTrack(root: JSONObject, preferredAudioLanguage: String): Boolean {
-    if (preferredAudioLanguage.isBlank() || preferredAudioLanguage.equals("auto", ignoreCase = true)) return true
-
-    val trackNames = mutableListOf<String>()
-
-    root.optJSONObject("streamingData")?.let { streamingData ->
-        listOf("formats", "adaptiveFormats").forEach { key ->
-            val formats = streamingData.optJSONArray(key) ?: return@forEach
-            for (i in 0 until formats.length()) {
-                val format = formats.optJSONObject(i) ?: continue
-                if (!format.optString("mimeType").startsWith("audio/")) continue
-                val track = format.optJSONObject("audioTrack") ?: continue
-                val name = track.optString("displayName")
-                    .ifEmpty { track.optString("locale") }
-                    .ifEmpty { track.optString("id") }
-                if (name.isNotBlank()) trackNames.add(name)
-            }
-        }
-    }
-
-    root.optJSONObject("captions")
-        ?.optJSONObject("playerCaptionsTracklistRenderer")
-        ?.optJSONArray("audioTracks")?.let { tracks ->
-            for (i in 0 until tracks.length()) {
-                val track = tracks.optJSONObject(i) ?: continue
-                val name = track.optString("displayName")
-                    .ifEmpty { track.optString("languageCode") }
-                if (name.isNotBlank()) trackNames.add(name)
-            }
-        }
-
-    if (trackNames.isEmpty()) return true
-
-    return trackNames.any { isTrackLanguageMatch(it, preferredAudioLanguage) }
-}
+private fun hasMatchingAudioTrack(root: JSONObject, preferredAudioLanguage: String): Boolean = true
 
 suspend fun resolveShortStream(
     okHttpClient: OkHttpClient,
     videoId: String,
     visitorData: String?,
     maxHeight: Int = 1080,
-    preferredAudioLanguage: String = "en"
-): Result<ResolvedStream> = withContext(Dispatchers.IO) {
+    preferredAudioLanguage: String = "en",
+    targetFps: Int = 0
+): Result<ResolvedShortStream> = withContext(Dispatchers.IO) {
     val hlCode = if (preferredAudioLanguage.isNotBlank() && !preferredAudioLanguage.equals("auto", ignoreCase = true)) {
         preferredAudioLanguage.lowercase()
     } else {
@@ -172,7 +224,8 @@ suspend fun resolveShortStream(
 
     val clients = listOf(
         Triple("ANDROID_VR", "1.60.19", "28") to "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; Quest 3 Build/SQ3A.220605.009.A1) gzip",
-        Triple("IOS", "20.10.4", "5") to "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)"
+        Triple("IOS", "20.10.4", "5") to "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)",
+        Triple("ANDROID", "20.10.38", "3") to "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US; Pixel 8 Build/UQ1A.240205.004; gzip)"
     )
 
     var lastError = "Unknown error"
@@ -180,6 +233,7 @@ suspend fun resolveShortStream(
     for ((clientInfo, userAgent) in clients) {
         val (clientName, clientVersion, clientId) = clientInfo
         val visitorField = if (visitorData != null) """"visitorData": "$visitorData",""" else ""
+        val sdkField = if (clientName == "ANDROID") """"androidSdkVersion": 35,""" else ""
 
         val jsonBody = """
             {
@@ -187,6 +241,7 @@ suspend fun resolveShortStream(
               "context": {
                 "client": {
                   $visitorField
+                  $sdkField
                   "clientName": "$clientName",
                   "clientVersion": "$clientVersion",
                   "hl": "$hlCode",
@@ -209,10 +264,14 @@ suspend fun resolveShortStream(
             ?: continue
 
         val root = JSONObject(responseText)
+        val captions = parseCaptionTracks(root)
 
-        val lengthSeconds = root.optJSONObject("videoDetails")
+        val videoDetails = root.optJSONObject("videoDetails")
+        val lengthSeconds = videoDetails
             ?.optString("lengthSeconds")
             ?.toIntOrNull() ?: 0
+        val resolvedChannelId = videoDetails?.optString("channelId").orEmpty()
+        val resolvedChannelTitle = videoDetails?.optString("author").orEmpty()
 
         if (lengthSeconds > 185) {
             return@withContext Result.failure(Exception("Skipped long video (${lengthSeconds}s)"))
@@ -230,6 +289,17 @@ suspend fun resolveShortStream(
         }
 
         val streamingData = root.optJSONObject("streamingData")
+        // Frame rate is only a tie-breaker at the chosen height; it never drops a higher
+        // resolution just because a lower one has the preferred frame rate. An explicit 30fps
+        // preference (including Auto on a slow link) wins ties over 60fps when both exist.
+        fun frameRateScore(fps: Int): Int {
+            val isHighFps = fps >= 55
+            return when {
+                targetFps >= 55 -> if (isHighFps) 2 else 1
+                targetFps in 1..54 -> if (isHighFps) 0 else 1
+                else -> if (isHighFps) 1 else 0
+            }
+        }
 
         if (streamingData != null) {
             // 1. Prefer a muxed progressive format - one URL starts faster than a merged stream.
@@ -237,17 +307,23 @@ suspend fun resolveShortStream(
             if (formats != null) {
                 var bestMuxedUrl: String? = null
                 var bestMuxedHeight = 0
+                var bestMuxedFpsScore = -1
                 for (i in 0 until formats.length()) {
                     val format = formats.optJSONObject(i) ?: continue
                     val url = format.optString("url").ifEmpty { continue }
                     val height = format.optInt("height", 0)
-                    if (height in 1..maxHeight && height > bestMuxedHeight) {
+                    val fpsScore = frameRateScore(format.optInt("fps", 30))
+                    if (height in 1..maxHeight &&
+                        (height > bestMuxedHeight ||
+                            (height == bestMuxedHeight && fpsScore > bestMuxedFpsScore))
+                    ) {
                         bestMuxedHeight = height
+                        bestMuxedFpsScore = fpsScore
                         bestMuxedUrl = url
                     }
                 }
                 if (bestMuxedUrl != null) {
-                    return@withContext Result.success(ResolvedStream.Single(bestMuxedUrl))
+                    return@withContext Result.success(ResolvedShortStream(ResolvedStream.Single(bestMuxedUrl), captions, resolvedChannelId, resolvedChannelTitle))
                 }
             }
 
@@ -256,6 +332,7 @@ suspend fun resolveShortStream(
             if (adaptive != null) {
                 var bestVideoUrl: String? = null
                 var bestVideoHeight = 0
+                var bestVideoFpsScore = -1
                 var smallestVideoUrl: String? = null
                 var smallestVideoHeight = Int.MAX_VALUE
 
@@ -273,8 +350,13 @@ suspend fun resolveShortStream(
 
                     if (mime.startsWith("video/mp4") && mime.contains("avc1")) {
                         val height = item.optInt("height", 0)
-                        if (height in 1..maxHeight && height >= bestVideoHeight) {
+                        val fpsScore = frameRateScore(item.optInt("fps", 30))
+                        if (height in 1..maxHeight &&
+                            (height > bestVideoHeight ||
+                                (height == bestVideoHeight && fpsScore > bestVideoFpsScore))
+                        ) {
                             bestVideoHeight = height
+                            bestVideoFpsScore = fpsScore
                             bestVideoUrl = url
                         }
                         if (height in 1 until smallestVideoHeight) {
@@ -317,7 +399,7 @@ suspend fun resolveShortStream(
                 // If nothing fits the cap, take the smallest available variant rather than dropping the Short.
                 val videoUrl = bestVideoUrl ?: smallestVideoUrl
                 if (videoUrl != null && bestAudioUrl != null) {
-                    return@withContext Result.success(ResolvedStream.Adaptive(videoUrl, bestAudioUrl))
+                    return@withContext Result.success(ResolvedShortStream(ResolvedStream.Adaptive(videoUrl, bestAudioUrl), captions, resolvedChannelId, resolvedChannelTitle))
                 }
             }
 
@@ -325,7 +407,7 @@ suspend fun resolveShortStream(
             //    extra manifest round-trip delays first frame when a direct URL is available.
             val hls = streamingData.optString("hlsManifestUrl")
             if (hls.isNotEmpty()) {
-                return@withContext Result.success(ResolvedStream.Single(hls))
+                return@withContext Result.success(ResolvedShortStream(ResolvedStream.Single(hls), captions, resolvedChannelId, resolvedChannelTitle))
             }
         }
 

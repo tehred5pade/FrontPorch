@@ -3,7 +3,10 @@ package io.tehred5pade.frontporch.ui.feed
 import android.content.res.Configuration
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -32,9 +35,9 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
 import io.tehred5pade.frontporch.FrontPorchApp
@@ -45,10 +48,109 @@ import io.tehred5pade.frontporch.data.local.WatchProgressRepository
 import io.tehred5pade.frontporch.data.playlist.PlaylistEntry
 import io.tehred5pade.frontporch.data.playlist.PlaylistStore
 import io.tehred5pade.frontporch.ui.common.frostedGlass
+import io.tehred5pade.frontporch.ui.downloads.DownloadQuality
 import io.tehred5pade.frontporch.ui.downloads.DownloadQualityDialog
 import io.tehred5pade.frontporch.ui.playlist.PlaylistDialog
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+
+data class FeedSelectionBarState(
+    val selectedCount: Int,
+    val onClear: () -> Unit,
+    val onDownload: () -> Unit
+)
+
+data class FeedVideoMenuState(
+    val video: FeedVideoItem,
+    val onDismiss: () -> Unit,
+    val onActionSelected: (VideoMenuAction) -> Unit
+)
+
+/**
+ * The multi-select action bar. Drawn by MainActivity as a sibling of the haze source,
+ * using the same haze state and glass style as the tab bar so blur/transparency match.
+ */
+@Composable
+fun FeedSelectionBar(
+    state: FeedSelectionBarState,
+    hazeState: HazeState?,
+    glassStyle: HazeStyle?,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = Color.Transparent,
+        modifier = modifier.frostedGlass(
+            hazeState = hazeState,
+            glassStyle = glassStyle,
+            shape = RoundedCornerShape(
+                topStart = 0.dp,
+                topEnd = 0.dp,
+                bottomStart = 20.dp,
+                bottomEnd = 20.dp
+            ),
+            elevation = 10.dp
+        )
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            IconButton(onClick = state.onClear) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Cancel selection"
+                )
+            }
+            Text(
+                text = "${state.selectedCount} selected",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f)
+            )
+            Button(onClick = state.onDownload) {
+                Icon(
+                    imageVector = Icons.Outlined.Download,
+                    contentDescription = "Download selected",
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Download")
+            }
+        }
+    }
+}
+
+/**
+ * Long-press video action menu. Drawn by MainActivity as a sibling of the haze source so
+ * its scrim does not blur the feed, while the menu still samples the feed's haze state.
+ */
+@Composable
+fun FeedVideoMenuOverlay(
+    state: FeedVideoMenuState,
+    hazeState: HazeState?,
+    glassStyle: HazeStyle?,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.25f))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() }
+            ) { state.onDismiss() },
+        contentAlignment = Alignment.Center
+    ) {
+        VideoOptionsPopup(
+            expanded = true,
+            onDismiss = state.onDismiss,
+            onActionSelected = state.onActionSelected,
+            hazeState = hazeState,
+            glassStyle = glassStyle
+        )
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -66,11 +168,14 @@ fun FeedScreen(
     bottomContentPadding: Dp = 0.dp,
     preferredAudioLanguage: String = "en",
     defaultDownloadQuality: String = "BEST_AVAILABLE",
+    allowHighResDownloads: Boolean = true,
     playlistStore: PlaylistStore? = null,
     onPlayPlaylistEntry: (PlaylistEntry) -> Unit = {},
     onStartBackgroundPlay: (FeedVideoItem) -> Unit = { onVideoClick(it) },
     onStartPopupPlay: (FeedVideoItem) -> Unit = { onVideoClick(it) },
-    onBackOverlayChanged: (String, Boolean) -> Unit = { _, _ -> }
+    onBackOverlayChanged: (String, Boolean) -> Unit = { _, _ -> },
+    onSelectionBarStateChanged: (FeedSelectionBarState?) -> Unit = {},
+    onVideoMenuStateChanged: (FeedVideoMenuState?) -> Unit = {}
 ) {
     val context = LocalContext.current
     val app = context.applicationContext as FrontPorchApp
@@ -90,7 +195,66 @@ fun FeedScreen(
     var selectedVideoIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var isSelectionMode by remember { mutableStateOf(false) }
     var pendingDownloadVideos by remember { mutableStateOf<List<FeedVideoItem>>(emptyList()) }
+    var availableDownloadQualities by remember { mutableStateOf<Set<DownloadQuality>?>(null) }
     var playlistDialogEntry by remember { mutableStateOf<PlaylistEntry?>(null) }
+
+    val selectionBarState = remember(selectedVideoIds, videos) {
+        if (selectedVideoIds.isEmpty()) {
+            null
+        } else {
+            FeedSelectionBarState(
+                selectedCount = selectedVideoIds.size,
+                onClear = {
+                    selectedVideoIds = emptySet()
+                    isSelectionMode = false
+                },
+                onDownload = {
+                    pendingDownloadVideos = videos.filter { it.videoId in selectedVideoIds }
+                }
+            )
+        }
+    }
+    LaunchedEffect(selectionBarState) {
+        onSelectionBarStateChanged(selectionBarState)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onSelectionBarStateChanged(null) }
+    }
+
+    val videoMenuState = remember(activeMenuVideo, context, playlistStore) {
+        val video = activeMenuVideo ?: return@remember null
+        FeedVideoMenuState(
+            video = video,
+            onDismiss = { activeMenuVideo = null },
+            onActionSelected = { action ->
+                activeMenuVideo = null
+                handleVideoMenuAction(
+                    context = context,
+                    video = video,
+                    action = action,
+                    onOpenPlaylistDialog = { videoItem ->
+                        playlistDialogEntry = PlaylistEntry(
+                            videoId = videoItem.videoId,
+                            title = videoItem.title,
+                            channelName = videoItem.channelName,
+                            thumbnailUrl = videoItem.thumbnailUrl
+                        )
+                    },
+                    onQueueDownload = { videoItem ->
+                        pendingDownloadVideos = listOf(videoItem)
+                    },
+                    onStartBackgroundPlay = { videoItem -> onStartBackgroundPlay(videoItem) },
+                    onStartPopupPlay = { videoItem -> onStartPopupPlay(videoItem) }
+                )
+            }
+        )
+    }
+    LaunchedEffect(videoMenuState) {
+        onVideoMenuStateChanged(videoMenuState)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onVideoMenuStateChanged(null) }
+    }
 
     // Keep these sections from also triggering the root "exit app" back handler.
     DisposableEffect(activeMenuVideo != null) {
@@ -161,20 +325,49 @@ fun FeedScreen(
         }
     }
 
+    // Probe the actual H.264 streams for the selected videos before showing options, so a
+    // video capped at 480p never offers 1080p and a 30fps-only source never offers 60fps.
+    LaunchedEffect(pendingDownloadVideos) {
+        if (pendingDownloadVideos.isEmpty()) {
+            availableDownloadQualities = null
+            return@LaunchedEffect
+        }
+        availableDownloadQualities = null
+        val probed = downloadManager.probeAvailableDownloadQualities(pendingDownloadVideos)
+        // An empty probe means NewPipe could not inspect the video at all. Falling back to the
+        // allowed list keeps existing behavior; a genuinely empty filtered set is left empty so
+        // the dialog can say that nothing is downloadable under the current settings.
+        availableDownloadQualities = probed.ifEmpty {
+            DownloadQuality.allowedDownloadQualities(allowHighResDownloads).toSet()
+        }
+    }
+
     if (pendingDownloadVideos.isNotEmpty()) {
         DownloadQualityDialog(
             videoCount = pendingDownloadVideos.size,
             defaultQualityName = defaultDownloadQuality,
+            availableQualities = availableDownloadQualities,
+            allowHighResDownloads = allowHighResDownloads,
+            hazeState = hazeState,
+            glassStyle = glassStyle,
             onDismiss = { pendingDownloadVideos = emptyList() },
             onConfirm = { quality ->
                 val targets = pendingDownloadVideos
                 pendingDownloadVideos = emptyList()
-                downloadManager.enqueueVideos(targets, quality, preferredAudioLanguage)
+                val effectiveQuality = if (
+                    !allowHighResDownloads &&
+                    (quality == DownloadQuality.BEST_AVAILABLE || DownloadQuality.isHighRes(quality))
+                ) {
+                    DownloadQuality.BEST_AVAILABLE_HD
+                } else {
+                    quality
+                }
+                downloadManager.enqueueVideos(targets, effectiveQuality, preferredAudioLanguage)
                 selectedVideoIds = emptySet()
                 isSelectionMode = false
                 Toast.makeText(
                     context,
-                    "Downloading ${targets.size} video(s) (${quality.label})",
+                    "Downloading ${targets.size} video(s) (${effectiveQuality.label})",
                     Toast.LENGTH_SHORT
                 ).show()
             }
@@ -187,6 +380,8 @@ fun FeedScreen(
             store = playlistStore,
             okHttpClient = okHttpClient,
             entry = dialogEntry,
+            hazeState = hazeState,
+            glassStyle = glassStyle,
             onPlayEntry = onPlayPlaylistEntry,
             onDismiss = { playlistDialogEntry = null }
         )
@@ -212,6 +407,7 @@ fun FeedScreen(
             onStartPopupPlay = { videoItem -> onStartPopupPlay(videoItem) }
         )
     }
+
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -245,49 +441,6 @@ fun FeedScreen(
         }
 
         Column(modifier = Modifier.fillMaxSize()) {
-            if (selectedVideoIds.isNotEmpty()) {
-                Surface(
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    tonalElevation = 4.dp,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
-                    ) {
-                        IconButton(onClick = {
-                            selectedVideoIds = emptySet()
-                            isSelectionMode = false
-                        }) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Cancel selection"
-                            )
-                        }
-                        Text(
-                            text = "${selectedVideoIds.size} selected",
-                            style = MaterialTheme.typography.titleMedium,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Button(
-                            onClick = {
-                                pendingDownloadVideos = videos.filter { it.videoId in selectedVideoIds }
-                            }
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Download,
-                                contentDescription = "Download selected",
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Download")
-                        }
-                    }
-                }
-            }
-
             val pullToRefreshState = rememberPullToRefreshState()
             PullToRefreshBox(
                 isRefreshing = isRefreshing,
@@ -391,6 +544,8 @@ fun FeedScreen(
                                         SubscriptionVideoCard(
                                             video = video,
                                             okHttpClient = okHttpClient,
+                                            hazeState = hazeState,
+                                            glassStyle = glassStyle,
                                             watchedFraction = progressById[video.videoId] ?: 0f,
                                             isSelectionMode = isSelectionMode,
                                             isSelected = isSelected,
@@ -453,6 +608,8 @@ fun FeedScreen(
                                         SubscriptionVideoCard(
                                             video = video,
                                             okHttpClient = okHttpClient,
+                                            hazeState = hazeState,
+                                            glassStyle = glassStyle,
                                             watchedFraction = progressById[video.videoId] ?: 0f,
                                             isSelectionMode = isSelectionMode,
                                             isSelected = isSelected,
@@ -530,6 +687,8 @@ fun FeedScreen(
 private fun SubscriptionVideoCard(
     video: FeedVideoItem,
     okHttpClient: OkHttpClient,
+    hazeState: HazeState?,
+    glassStyle: HazeStyle?,
     watchedFraction: Float,
     isSelectionMode: Boolean,
     isSelected: Boolean,
@@ -617,21 +776,6 @@ private fun SubscriptionVideoCard(
                     text = if (timeLabel.isNotEmpty()) "${video.channelName} • $timeLabel" else video.channelName,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            // Anchored 8.dp inside the artwork's top-left, but measured against the
-            // whole card so all six flat actions remain visible without scrolling.
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .offset(x = 8.dp, y = 8.dp)
-                    .zIndex(2f)
-            ) {
-                VideoOptionsPopup(
-                    expanded = isMenuExpanded,
-                    onDismiss = onDismissMenu,
-                    onActionSelected = onMenuAction
                 )
             }
         }

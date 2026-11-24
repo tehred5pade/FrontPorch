@@ -2,7 +2,9 @@ package io.tehred5pade.frontporch.ui.player
 
 import android.content.res.Configuration
 import android.net.Uri
+import android.view.LayoutInflater
 import android.view.ViewGroup
+import io.tehred5pade.frontporch.R
 import androidx.annotation.OptIn
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -30,14 +32,18 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.ui.PlayerView
 import io.tehred5pade.frontporch.ResolvedStream
 import io.tehred5pade.frontporch.data.innertube.*
@@ -47,12 +53,14 @@ import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockRepository
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.service.PlaybackSessionHolder
+import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import org.json.JSONObject
 
 private class PlaybackSnapshot(
     var posMs: Long = 0L,
@@ -145,6 +153,19 @@ fun VideoPlayerScreen(
     var scrubFraction by remember(videoId) { mutableFloatStateOf(0f) }
     var webViewRef by remember(videoId) { mutableStateOf<BackgroundWebView?>(null) }
     var showControls by remember(videoId) { mutableStateOf(true) }
+    var currentQuality by remember(videoId) { mutableStateOf("Auto") }
+    var currentCaption by remember(videoId) { mutableStateOf("Off") }
+    // Captions fetched independently of stream resolution. The WebView fallback is used
+    // when the player endpoint rejects a video, but its caption tracks are often still
+    // available from the same endpoint.
+    var fallbackCaptions by remember(videoId) { mutableStateOf<List<CaptionTrack>>(emptyList()) }
+    var fallbackVttText by remember(videoId) { mutableStateOf<String?>(null) }
+    val activeCaptions = details?.captions.orEmpty().ifEmpty { fallbackCaptions }
+    val availableCaptions = listOf("Off", "On", "Auto")
+    val latestCaption = rememberUpdatedState(currentCaption)
+    val latestCaptionsEnabled = rememberUpdatedState(captionsEnabled)
+    val latestActiveCaptions = rememberUpdatedState(activeCaptions)
+    val latestFallbackVttText = rememberUpdatedState(fallbackVttText)
 
     // Auto-hide controls 3 seconds after playing
     LaunchedEffect(showControls, isPlaying) {
@@ -196,6 +217,19 @@ fun VideoPlayerScreen(
                         }
                     }
 
+                    override fun onTracksChanged(tracks: Tracks) {
+                        // Subtitle sources can become available after the user picks a track.
+                        val label = latestCaption.value
+                        if (label != "Off") {
+                            val captions = details?.captions.orEmpty()
+                            applyCaptionTrackSelection(
+                                this@apply,
+                                resolveCaptionTrack(captions, label),
+                                isGenericCaptionSelection(label)
+                            )
+                        }
+                    }
+
                     override fun onPlayerError(error: PlaybackException) {
                         val list = details?.candidates.orEmpty()
                         val nextIdx = candidateIndex + 1
@@ -212,16 +246,13 @@ fun VideoPlayerScreen(
                                     .setAllowCrossProtocolRedirects(true)
                                 val sourceFactory = DefaultMediaSourceFactory(httpFactory)
 
-                                when (val s = candidate.stream) {
-                                    is ResolvedStream.Single -> {
-                                        setMediaSource(sourceFactory.createMediaSource(MediaItem.fromUri(s.url)))
-                                    }
-                                    is ResolvedStream.Adaptive -> {
-                                        val v = sourceFactory.createMediaSource(MediaItem.fromUri(s.videoUrl))
-                                        val a = sourceFactory.createMediaSource(MediaItem.fromUri(s.audioUrl))
-                                        setMediaSource(MergingMediaSource(true, true, v, a))
-                                    }
-                                }
+                                setMediaSource(
+                                    buildStreamMediaSource(
+                                        sourceFactory = sourceFactory,
+                                        stream = candidate.stream,
+                                        captions = details?.captions.orEmpty()
+                                    )
+                                )
                                 prepare()
                                 play()
                             }
@@ -238,6 +269,19 @@ fun VideoPlayerScreen(
             }
     }
 
+    // A new video must never inherit the previous video's selected text track.
+    LaunchedEffect(videoId, exoPlayer) {
+        currentCaption = "Off"
+        captionsEnabled = false
+        fallbackCaptions = emptyList()
+        fallbackVttText = null
+        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            .setPreferredTextLanguage(null)
+            .build()
+    }
+
     fun playCandidate(candidate: PlayableCandidate) {
         val activeToken = details?.resolvedVisitorData ?: visitorData
         val headers = buildMap {
@@ -249,16 +293,13 @@ fun VideoPlayerScreen(
             .setAllowCrossProtocolRedirects(true)
         val sourceFactory = DefaultMediaSourceFactory(httpFactory)
 
-        when (val s = candidate.stream) {
-            is ResolvedStream.Single -> {
-                exoPlayer.setMediaSource(sourceFactory.createMediaSource(MediaItem.fromUri(s.url)))
-            }
-            is ResolvedStream.Adaptive -> {
-                val v = sourceFactory.createMediaSource(MediaItem.fromUri(s.videoUrl))
-                val a = sourceFactory.createMediaSource(MediaItem.fromUri(s.audioUrl))
-                exoPlayer.setMediaSource(MergingMediaSource(true, true, v, a))
-            }
-        }
+        exoPlayer.setMediaSource(
+            buildStreamMediaSource(
+                sourceFactory = sourceFactory,
+                stream = candidate.stream,
+                captions = details?.captions.orEmpty()
+            )
+        )
         exoPlayer.prepare()
         exoPlayer.play()
         PlaybackSessionHolder.attachOfflinePlayer(
@@ -433,6 +474,10 @@ fun VideoPlayerScreen(
                         var v = document.querySelector('video.html5-main-video') || videos[0];
                         if (!v) return 'NO_VIDEO';
 
+                        if (typeof window.__fpSkipAd === 'function') {
+                            try { if (window.__fpSkipAd()) return 'AD_SKIPPED'; } catch (e) {}
+                        }
+
                         // A previous ad may have left a video element sped up. Restore every
                         // element before deciding whether a new ad is actually showing.
                         for (var i = 0; i < videos.length; i++) {
@@ -556,6 +601,9 @@ fun VideoPlayerScreen(
                     }
                     var v = document.querySelector('video.html5-main-video') || document.querySelector('video');
                     if (!v) return '0';
+                    if (typeof window.__fpSkipAd === 'function') {
+                        try { window.__fpSkipAd(); } catch (e) {}
+                    }
                     if (v.muted) v.muted = false;
                     if (v.volume < 1) v.volume = 1.0;
 
@@ -699,6 +747,37 @@ fun VideoPlayerScreen(
         comments = videoService.fetchVideoComments(videoId, visitorData)
     }
 
+    // Stream resolution can fail while caption tracks are still available. Fetch them
+    // separately so the fallback WebView player also has real caption options.
+    LaunchedEffect(videoId, useFallbackPlayer, details) {
+        if (!useFallbackPlayer || !details?.captions.isNullOrEmpty()) return@LaunchedEffect
+        fallbackCaptions = videoService.fetchCaptionTracksOnly(videoId)
+    }
+
+    // Download the selected WebVTT body in Kotlin. The WebView loads m.youtube.com, so a
+    // direct fetch of www.youtube.com/api/timedtext would be blocked by CORS.
+    LaunchedEffect(videoId, useFallbackPlayer, currentCaption, activeCaptions) {
+        if (!useFallbackPlayer) return@LaunchedEffect
+        fallbackVttText = resolveCaptionTrack(activeCaptions, currentCaption)
+            ?.let { videoService.fetchCaptionVtt(it) }
+    }
+
+    // YouTube's web player can re-enable captions by itself after ads or quality changes.
+    // Keep re-asserting the user's choice while the fallback player is mounted.
+    LaunchedEffect(useFallbackPlayer, webViewRef, captionsEnabled, currentCaption) {
+        if (!useFallbackPlayer) return@LaunchedEffect
+        while (true) {
+            delay(1000L)
+            val track = resolveCaptionTrack(latestActiveCaptions.value, latestCaption.value)
+            applyClosedCaptionsJs(
+                webView = webViewRef,
+                enabled = latestCaptionsEnabled.value,
+                vttText = latestFallbackVttText.value,
+                label = track?.label.orEmpty()
+            )
+        }
+    }
+
     // Seamless orientation changes without recreating Activity or WebView
     DisposableEffect(isLandscape) {
         val window = (context as? android.app.Activity)?.window
@@ -783,7 +862,7 @@ fun VideoPlayerScreen(
                                         url: String?,
                                         favicon: android.graphics.Bitmap?
                                     ) {
-                                        val ccVal = if (captionsEnabled) "true" else "false"
+                                        val ccVal = if (latestCaptionsEnabled.value) "true" else "false"
                                         view?.evaluateJavascript(
                                             """
                                             try {
@@ -806,12 +885,22 @@ fun VideoPlayerScreen(
 
                                     override fun onPageCommitVisible(view: android.webkit.WebView?, url: String?) {
                                         injectCleanPlayerJs(view)
-                                        applyClosedCaptionsJs(view, captionsEnabled)
+                                        applyClosedCaptionsJs(
+                                            webView = view,
+                                            enabled = latestCaptionsEnabled.value,
+                                            vttText = latestFallbackVttText.value,
+                                            label = resolveCaptionTrack(latestActiveCaptions.value, latestCaption.value)?.label.orEmpty()
+                                        )
                                     }
 
                                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                                         injectCleanPlayerJs(view)
-                                        applyClosedCaptionsJs(view, captionsEnabled)
+                                        applyClosedCaptionsJs(
+                                            webView = view,
+                                            enabled = latestCaptionsEnabled.value,
+                                            vttText = latestFallbackVttText.value,
+                                            label = resolveCaptionTrack(latestActiveCaptions.value, latestCaption.value)?.label.orEmpty()
+                                        )
                                     }
                                 }
 
@@ -839,7 +928,7 @@ fun VideoPlayerScreen(
                 } else {
                     AndroidView(
                         factory = { ctx ->
-                            PlayerView(ctx).apply {
+                            (LayoutInflater.from(ctx).inflate(R.layout.view_video_player, null) as PlayerView).apply {
                                 layoutParams = ViewGroup.LayoutParams(
                                     ViewGroup.LayoutParams.MATCH_PARENT,
                                     ViewGroup.LayoutParams.MATCH_PARENT
@@ -854,6 +943,18 @@ fun VideoPlayerScreen(
                         },
                         update = { playerView ->
                             playerView.keepScreenOn = isPlaying
+                            // PlayerView owns subtitleView visibility. Only style the view here;
+                            // forcing visibility fights its internal cue-based show/hide logic.
+                            playerView.subtitleView?.setStyle(
+                                androidx.media3.ui.CaptionStyleCompat(
+                                    android.graphics.Color.WHITE,
+                                    android.graphics.Color.TRANSPARENT,
+                                    android.graphics.Color.TRANSPARENT,
+                                    androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                                    android.graphics.Color.BLACK,
+                                    null
+                                )
+                            )
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -945,7 +1046,28 @@ fun VideoPlayerScreen(
                     hasPreviousVideo = hasPreviousVideo,
                     hasNextVideo = hasNextVideo,
                     sponsorSegments = if (sponsorBlockEnabled) activeSegments else emptyList(),
-                    onToggleControls = { showControls = !showControls },
+                    currentQuality = currentQuality,
+                    currentCaption = currentCaption,
+                    availableCaptions = availableCaptions,
+                    onQualitySelected = { q ->
+                        currentQuality = q
+                        applyVideoQualityJs(webViewRef, q)
+                    },
+                    onCaptionSelected = { c ->
+                        currentCaption = c
+                        captionsEnabled = (c != "Off")
+                        val selectedTrack = resolveCaptionTrack(activeCaptions, c)
+                        if (!useFallbackPlayer) {
+                            applyCaptionTrackSelection(exoPlayer, selectedTrack, isGenericCaptionSelection(c))
+                        } else {
+                            applyClosedCaptionsJs(
+                                webView = webViewRef,
+                                enabled = captionsEnabled,
+                                vttText = if (captionsEnabled) fallbackVttText else null,
+                                label = selectedTrack?.label.orEmpty()
+                            )
+                        }
+                    },
                     onPreviousVideo = onPreviousVideo,
                     onReplay10 = { seekRelativeSeconds(-10L) },
                     onTogglePlayPause = { PlaybackSessionHolder.togglePlayPause() },
@@ -1060,21 +1182,292 @@ fun VideoPlayerScreen(
     }
 }
 
-private fun applyClosedCaptionsJs(webView: android.webkit.WebView?, enabled: Boolean) {
+private fun applyVideoQualityJs(webView: android.webkit.WebView?, quality: String) {
+    val qCode = when (quality) {
+        "1080p" -> "hd1080"
+        "720p" -> "hd720"
+        "480p" -> "large"
+        "360p" -> "medium"
+        else -> "default"
+    }
     webView?.evaluateJavascript(
         """
         (function() {
-            var want = $enabled;
-            var ccBtn = document.querySelector('.ytp-subtitles-button');
-            if (ccBtn) {
-                var pressed = ccBtn.getAttribute('aria-pressed') === 'true';
-                if (pressed !== want) ccBtn.click();
+            var mp = document.getElementById('movie_player');
+            if (mp && typeof mp.setPlaybackQualityRange === 'function') {
+                mp.setPlaybackQualityRange('$qCode');
             }
-            var v = document.querySelector('video.html5-main-video') || document.querySelector('video');
-            if (v && v.textTracks) {
-                for (var i = 0; i < v.textTracks.length; i++) {
-                    v.textTracks[i].mode = want ? 'showing' : 'disabled';
-                }
+            if (mp && typeof mp.setPlaybackQuality === 'function') {
+                mp.setPlaybackQuality('$qCode');
+            }
+        })();
+        """.trimIndent(),
+        null
+    )
+}
+
+@OptIn(UnstableApi::class)
+private fun buildStreamMediaSource(
+    sourceFactory: DefaultMediaSourceFactory,
+    stream: ResolvedStream,
+    captions: List<CaptionTrack>
+): MediaSource {
+    val subtitles = captions.map { caption ->
+        MediaItem.SubtitleConfiguration.Builder(Uri.parse(caption.url))
+            .setMimeType(MimeTypes.TEXT_VTT)
+            .setLanguage(caption.languageCode)
+            .setLabel(caption.label)
+            .build()
+    }
+    return when (stream) {
+        is ResolvedStream.Single -> sourceFactory.createMediaSource(
+            MediaItem.Builder()
+                .setUri(stream.url)
+                .setSubtitleConfigurations(subtitles)
+                .build()
+        )
+        is ResolvedStream.Adaptive -> {
+            // DefaultMediaSourceFactory merges subtitle configurations into the video
+            // source, so the text tracks arrive alongside the adaptive video/audio legs.
+            val video = sourceFactory.createMediaSource(
+                MediaItem.Builder()
+                    .setUri(stream.videoUrl)
+                    .setSubtitleConfigurations(subtitles)
+                    .build()
+            )
+            val audio = sourceFactory.createMediaSource(MediaItem.fromUri(stream.audioUrl))
+            MergingMediaSource(true, true, video, audio)
+        }
+    }
+}
+
+/**
+ * "On" prefers human-authored captions and "Auto" prefers auto-generated captions.
+ * Both select the track matching the device language before falling back to any
+ * available track, so the CC menu only needs the three generic choices.
+ */
+internal fun resolveCaptionTrack(
+    captions: List<CaptionTrack>,
+    selection: String,
+    locale: Locale = Locale.getDefault()
+): CaptionTrack? {
+    if (selection == "Off") return null
+    if (selection != "On" && selection != "Auto") {
+        return captions.firstOrNull { it.label == selection }
+    }
+
+    val preferAutoGenerated = selection == "Auto"
+    val systemLanguageMatches = captions
+        .map { it to it.systemLanguageMatchRank(locale) }
+        .filter { (_, rank) -> rank > 0 }
+        .sortedByDescending { (_, rank) -> rank }
+        .map { (caption, _) -> caption }
+
+    return systemLanguageMatches.firstOrNull { it.isAutoGenerated == preferAutoGenerated }
+        ?: systemLanguageMatches.firstOrNull()
+        ?: captions.firstOrNull { it.isAutoGenerated == preferAutoGenerated }
+        ?: captions.firstOrNull()
+}
+
+private fun CaptionTrack.systemLanguageMatchRank(locale: Locale): Int {
+    val captionTag = normalizedLanguageTag(languageCode)
+    val systemTag = locale.normalizedTag()
+    val systemLanguage = normalizedLanguage(locale.language)
+    return when {
+        captionTag == systemTag -> 4
+        captionTag == systemLanguage -> 3
+        captionTag.substringBefore('-') == systemLanguage -> 2
+        else -> 0
+    }
+}
+
+private fun Locale.normalizedTag(): String {
+    val language = normalizedLanguage(this.language)
+    val script = script.takeIf { it.isNotBlank() }?.lowercase(Locale.ROOT)
+    val country = country.takeIf { it.isNotBlank() }?.lowercase(Locale.ROOT)
+    return listOfNotNull(language, script, country).joinToString("-")
+}
+
+private fun normalizedLanguageTag(tag: String): String {
+    val parts = tag.split('-', '_').filter { it.isNotBlank() }
+    if (parts.isEmpty()) return ""
+    val language = normalizedLanguage(parts[0])
+    return if (parts.size > 1) "$language-${parts[1].lowercase(Locale.ROOT)}" else language
+}
+
+private fun normalizedLanguage(language: String): String =
+    when (language.lowercase(Locale.ROOT)) {
+        "iw" -> "he"
+        "in" -> "id"
+        "ji" -> "yi"
+        else -> language.lowercase(Locale.ROOT)
+    }
+
+internal fun isGenericCaptionSelection(selection: String): Boolean =
+    selection == "On" || selection == "Auto"
+
+/** Selects the requested caption track, or fully disables text tracks for "Off". */
+internal fun applyCaptionTrackSelection(
+    player: ExoPlayer,
+    caption: CaptionTrack?,
+    enableIfNoTrack: Boolean = false
+) {
+    val builder = player.trackSelectionParameters.buildUpon()
+        .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+
+    if (caption == null) {
+        // With no parsed track to select, "On"/"Auto" still enable any embedded
+        // text tracks (for example subtitles carried inside an HLS manifest).
+        builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, !enableIfNoTrack)
+            .setPreferredTextLanguage(null)
+        player.trackSelectionParameters = builder.build()
+        return
+    }
+
+    builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+        .setPreferredTextLanguage(caption.languageCode)
+
+    // Prefer the exact track when it is already available; setPreferredTextLanguage
+    // above still selects it if the subtitle tracks load a moment later.
+    var override: TrackSelectionOverride? = null
+    var languageFallback: TrackSelectionOverride? = null
+    for (group in player.currentTracks.groups) {
+        if (group.type != C.TRACK_TYPE_TEXT || !group.isSupported) continue
+        for (i in 0 until group.length) {
+            val format = group.getTrackFormat(i)
+            if (format.label?.equals(caption.label, ignoreCase = true) == true) {
+                override = TrackSelectionOverride(group.mediaTrackGroup, i)
+                break
+            }
+            if (languageFallback == null && format.language.equals(caption.languageCode, ignoreCase = true)) {
+                languageFallback = TrackSelectionOverride(group.mediaTrackGroup, i)
+            }
+        }
+        if (override != null) break
+    }
+    (override ?: languageFallback)?.let { builder.setOverrideForType(it) }
+    player.trackSelectionParameters = builder.build()
+}
+
+/**
+ * Renders WebVTT captions directly inside the fallback WebView. YouTube's mobile player
+ * exposes its own caption API, but it is unreliable in a WebView (the button is hidden by
+ * our clean-player CSS and setOption often no-ops). Drawing the cues ourselves works for
+ * Off/On/Auto and survives ads and quality changes.
+ */
+private fun applyClosedCaptionsJs(
+    webView: android.webkit.WebView?,
+    enabled: Boolean,
+    vttText: String?,
+    label: String
+) {
+    val wantJs = if (enabled) "true" else "false"
+    val vttJs = JSONObject.quote(vttText.orEmpty())
+    val labelJs = JSONObject.quote(label)
+    webView?.evaluateJavascript(
+        """
+        (function() {
+            var want = $wantJs;
+            var vtt = $vttJs;
+            var label = $labelJs;
+
+            if (!window.__fpCcRuntimeInstalled) {
+                window.__fpCcRuntimeInstalled = true;
+
+                window.__fpCcParseTime = function(value) {
+                    var parts = String(value || '0').split(':');
+                    var seconds = parseFloat(parts[parts.length - 1]) || 0;
+                    if (parts.length > 1) seconds += (parseInt(parts[parts.length - 2], 10) || 0) * 60;
+                    if (parts.length > 2) seconds += (parseInt(parts[parts.length - 3], 10) || 0) * 3600;
+                    return seconds;
+                };
+
+                window.__fpCcParseVtt = function(text) {
+                    var cues = [];
+                    var lines = String(text || '').replace(/\r/g, '').split('\n');
+                    for (var i = 0; i < lines.length; i++) {
+                        if (lines[i].indexOf('-->') < 0) continue;
+                        var timing = lines[i].split('-->');
+                        if (timing.length < 2) continue;
+                        var start = window.__fpCcParseTime(timing[0].trim().split(' ')[0]);
+                        var end = window.__fpCcParseTime(timing[1].trim().split(' ')[0]);
+                        var cueLines = [];
+                        i++;
+                        while (i < lines.length && lines[i].trim() !== '') {
+                            cueLines.push(lines[i]);
+                            i++;
+                        }
+                        if (cueLines.length > 0) {
+                            cues.push({ start: start, end: end, text: cueLines.join('\n') });
+                        }
+                    }
+                    return cues;
+                };
+
+                window.__fpCcOverlay = function() {
+                    var overlay = document.getElementById('fp-caption-overlay');
+                    if (!overlay) {
+                        overlay = document.createElement('div');
+                        overlay.id = 'fp-caption-overlay';
+                        overlay.style.cssText = 'position:fixed;left:0;right:0;bottom:13%;z-index:2147483647;' +
+                            'text-align:center;pointer-events:none;color:#fff;' +
+                            'white-space:pre-line;' +
+                            'font:600 clamp(16px,4.2vw,46px)/1.25 Roboto,Arial,sans-serif;' +
+                            'text-shadow:0 2px 4px #000,0 0 8px #000;display:none;';
+                        (document.body || document.documentElement).appendChild(overlay);
+                    }
+                    return overlay;
+                };
+
+                window.__fpCcTick = function() {
+                    var state = window.__fpCcState || {};
+                    var overlay = window.__fpCcOverlay();
+                    var video = document.querySelector('video.html5-main-video') || document.querySelector('video');
+                    var cue = null;
+                    if (state.enabled && video && state.cues && state.cues.length > 0) {
+                        var t = video.currentTime;
+                        for (var i = 0; i < state.cues.length; i++) {
+                            var candidate = state.cues[i];
+                            if (t >= candidate.start && t < candidate.end) {
+                                cue = candidate;
+                                break;
+                            }
+                        }
+                    }
+                    if (cue) {
+                        overlay.textContent = cue.text.replace(/<[^>]*>/g, '');
+                        overlay.style.display = 'block';
+                    } else {
+                        overlay.style.display = 'none';
+                    }
+                    requestAnimationFrame(window.__fpCcTick);
+                };
+                requestAnimationFrame(window.__fpCcTick);
+            }
+
+            var state = window.__fpCcState || (window.__fpCcState = {});
+            var key = label + '|' + vtt.length;
+            if (state.key !== key || state.enabled !== want) {
+                state.key = key;
+                state.enabled = want;
+                state.cues = want && vtt ? window.__fpCcParseVtt(vtt) : [];
+            }
+
+            // Suppress YouTube's own caption renderer so cues are not duplicated.
+            var style = document.getElementById('fp-cc-style');
+            if (!style && document.head) {
+                style = document.createElement('style');
+                style.id = 'fp-cc-style';
+                document.head.appendChild(style);
+            }
+            if (style) {
+                style.textContent = '.ytp-caption-window-container, .ytp-caption-window-bottom, ' +
+                    '.ytp-caption-window-top, .caption-window { display: none !important; }';
+            }
+            var button = document.querySelector('.ytp-subtitles-button, .ytp-subtitles-button-renderer, button[aria-label*="Subtitles"], button[title*="Subtitles"]');
+            if (button) {
+                var pressed = button.getAttribute('aria-pressed') === 'true' || button.classList.contains('ytp-button-selected');
+                if (pressed) { try { button.click(); } catch (e) {} }
             }
         })();
         """.trimIndent(),
@@ -1132,6 +1525,18 @@ private fun injectCleanPlayerJs(webView: android.webkit.WebView?) {
                     .ytp-upnext,
                     .ytp-videowall-still,
                     .ytp-pause-overlay,
+                    /* Ad artwork/text shown as a post-roll overlay. Skip controls are
+                       deliberately not hidden so the ad killer can still click them. */
+                    .ytp-ad-image-overlay,
+                    .ytp-ad-text-overlay,
+                    .ytp-ad-player-overlay,
+                    .ytp-ad-overlay-container,
+                    .ytp-ad-action-interstitial,
+                    .ytp-ad-bumper,
+                    .ytp-ad-message-container,
+                    .ytp-ad-preview-container,
+                    .ytp-ad-progress-list,
+                    ytm-ad-badge-renderer,
                     ytm-autonav-overlay-renderer,
                     .ytm-autonav-bar,
                     .ytp-unmute,
@@ -1201,6 +1606,68 @@ private fun injectCleanPlayerJs(webView: android.webkit.WebView?) {
                 video.controls = false;
                 video.muted = false;
                 video.volume = 1.0;
+            }
+
+            // Post-roll ads do not always set YouTube's ad-showing class. Kill any
+            // short secondary video and click visible skip controls on a fast timer,
+            // independent of the Compose watcher below.
+            if (!window.__fpAdKillerInstalled) {
+                window.__fpAdKillerInstalled = true;
+                window.__fpSkipAd = function() {
+                    var player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
+                    var allVideos = Array.prototype.slice.call(document.querySelectorAll('video'));
+                    var mainVideo = document.querySelector('video.html5-main-video') || allVideos[0];
+                    var adShowing = !!(player && (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')));
+                    var skipSelectors = [
+                        '.ytp-ad-skip-button',
+                        '.ytp-skip-ad-button',
+                        '.ytp-ad-skip-button-modern',
+                        '.ytp-ad-skip-button-slot button',
+                        '.ytp-ad-skip-button-container button',
+                        '.ytm-ad-skip-button',
+                        '.skip-ad-button',
+                        '[data-testid*="skip-ad"]',
+                        '[aria-label*="Skip ad" i]'
+                    ];
+                    var skipBtn = null;
+                    for (var s = 0; s < skipSelectors.length; s++) {
+                        var candidate = document.querySelector(skipSelectors[s]);
+                        if (!candidate || candidate.disabled || candidate.getAttribute('aria-disabled') === 'true') continue;
+                        var cs = window.getComputedStyle(candidate);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || candidate.getClientRects().length === 0) continue;
+                        skipBtn = candidate;
+                        break;
+                    }
+                    if (skipBtn) {
+                        try { skipBtn.click(); } catch (e) {}
+                    }
+
+                    var killedAdVideo = false;
+                    for (var i = 0; i < allVideos.length; i++) {
+                        var adVideo = allVideos[i];
+                        if (adVideo === mainVideo) continue;
+                        if (!isFinite(adVideo.duration) || adVideo.duration <= 0 || adVideo.duration > 180) continue;
+                        if (adVideo.paused || adVideo.ended) continue;
+                        try {
+                            adVideo.muted = true;
+                            adVideo.playbackRate = 16.0;
+                            adVideo.currentTime = adVideo.duration;
+                            killedAdVideo = true;
+                        } catch (e) {}
+                    }
+
+                    if (adShowing && player && typeof player.skip === 'function') {
+                        try { player.skip(); killedAdVideo = true; } catch (e) {}
+                    }
+                    return killedAdVideo || !!skipBtn;
+                };
+                setInterval(window.__fpSkipAd, 120);
+                document.addEventListener('ended', function(e) {
+                    if (!e.target || e.target.tagName !== 'VIDEO') return;
+                    if (e.target !== (document.querySelector('video.html5-main-video') || document.querySelector('video'))) return;
+                    try { e.target.pause(); } catch (err) {}
+                    window.__fpSkipAd();
+                }, true);
             }
         })();
         """.trimIndent(),

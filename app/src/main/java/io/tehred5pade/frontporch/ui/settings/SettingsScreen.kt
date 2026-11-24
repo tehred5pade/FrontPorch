@@ -38,6 +38,7 @@ import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorCategory
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.ui.common.InlineMenu
+import io.tehred5pade.frontporch.update.UpdateSettingsSection
 import io.tehred5pade.frontporch.ui.theme.AppBackgroundTheme
 import io.tehred5pade.frontporch.ui.theme.AppHighlightColor
 import kotlinx.coroutines.launch
@@ -92,10 +93,12 @@ fun SettingsScreen(
     onCustomCategoriesChanged: (Set<String>) -> Unit,
     onRepeatCooldownChanged: (ShortRepeatCooldown) -> Unit = {},
     onAudioLanguageChanged: (String) -> Unit = {},
-    onWifiQualityChanged: (Int) -> Unit = {},
-    onMobileQualityChanged: (Int) -> Unit = {},
-    onWifiDownloadQualityChanged: (Int) -> Unit = {},
-    onMobileDownloadQualityChanged: (Int) -> Unit = {},
+    onWifiQualityChanged: (Int, Int) -> Unit = { _, _ -> },
+    onMobileQualityChanged: (Int, Int) -> Unit = { _, _ -> },
+    onWifiDownloadQualityChanged: (Int, Int) -> Unit = { _, _ -> },
+    onMobileDownloadQualityChanged: (Int, Int) -> Unit = { _, _ -> },
+    allowHighResContent: Boolean = true,
+    onAllowHighResContentChanged: (Boolean) -> Unit = {},
     onPlayerGesturesChanged: (Boolean) -> Unit = {},
     onNavigateToChannels: () -> Unit = {},
     onImportUri: suspend (Uri) -> Result<Int> = { Result.success(0) },
@@ -154,13 +157,19 @@ fun SettingsScreen(
         item {
             QualitySettingsCard(
                 wifiQualityHeight = userSettings.wifiStreamMaxHeight,
+                wifiStreamTargetFps = userSettings.wifiStreamTargetFps,
                 mobileQualityHeight = userSettings.mobileStreamMaxHeight,
+                mobileStreamTargetFps = userSettings.mobileStreamTargetFps,
                 wifiDownloadHeight = userSettings.wifiDownloadMaxHeight,
+                wifiDownloadTargetFps = userSettings.wifiDownloadTargetFps,
                 mobileDownloadHeight = userSettings.mobileDownloadMaxHeight,
+                mobileDownloadTargetFps = userSettings.mobileDownloadTargetFps,
+                allowHighResContent = allowHighResContent,
                 onWifiQualitySelected = onWifiQualityChanged,
                 onMobileQualitySelected = onMobileQualityChanged,
                 onWifiDownloadSelected = onWifiDownloadQualityChanged,
-                onMobileDownloadSelected = onMobileDownloadQualityChanged
+                onMobileDownloadSelected = onMobileDownloadQualityChanged,
+                onAllowHighResContentChanged = onAllowHighResContentChanged
             )
         }
 
@@ -278,6 +287,11 @@ fun SettingsScreen(
                 }
             }
         }
+
+        // 9. App Updates (GitHub Releases / APK installer)
+        item {
+            UpdateSettingsSection()
+        }
     }
 
     // Sub Menu: Categories & Shorts Feed Configuration
@@ -389,38 +403,81 @@ fun AudioLanguageCard(
     }
 }
 
+private data class QualityOption(val height: Int, val fps: Int, val label: String)
+
+/** Auto is stream-only; height 0 tells the resolver to adapt to the current link speed. */
+private fun streamQualityOptions(allowHighRes: Boolean): List<QualityOption> = buildList {
+    add(QualityOption(0, 0, "Auto"))
+    if (allowHighRes) {
+        add(QualityOption(4320, 0, "Best Available"))
+        add(QualityOption(2160, 0, "2160p (4K)"))
+        add(QualityOption(1440, 0, "1440p (2K)"))
+    }
+    add(QualityOption(1080, 60, "1080p 60fps"))
+    add(QualityOption(1080, 0, "1080p"))
+    add(QualityOption(720, 60, "720p 60fps"))
+    add(QualityOption(720, 0, "720p"))
+    add(QualityOption(480, 0, "480p"))
+    add(QualityOption(360, 0, "360p"))
+    add(QualityOption(240, 0, "240p"))
+    add(QualityOption(144, 0, "144p"))
+}
+
+/** Downloads keep the same 60fps choices but never expose Auto. */
+private fun downloadQualityOptions(allowHighRes: Boolean): List<QualityOption> = buildList {
+    if (allowHighRes) {
+        add(QualityOption(4320, 0, "Best Available"))
+        add(QualityOption(2160, 0, "2160p (4K)"))
+        add(QualityOption(1440, 0, "1440p (2K)"))
+    }
+    add(QualityOption(1080, 60, "1080p 60fps"))
+    add(QualityOption(1080, 0, "1080p"))
+    add(QualityOption(720, 60, "720p 60fps"))
+    add(QualityOption(720, 0, "720p"))
+    add(QualityOption(480, 0, "480p"))
+    add(QualityOption(360, 0, "360p"))
+    add(QualityOption(240, 0, "240p"))
+    add(QualityOption(144, 0, "144p"))
+}
+
 @Composable
 fun QualitySettingsCard(
     wifiQualityHeight: Int,
+    wifiStreamTargetFps: Int,
     mobileQualityHeight: Int,
+    mobileStreamTargetFps: Int,
     wifiDownloadHeight: Int,
+    wifiDownloadTargetFps: Int,
     mobileDownloadHeight: Int,
-    onWifiQualitySelected: (Int) -> Unit,
-    onMobileQualitySelected: (Int) -> Unit,
-    onWifiDownloadSelected: (Int) -> Unit,
-    onMobileDownloadSelected: (Int) -> Unit
+    mobileDownloadTargetFps: Int,
+    allowHighResContent: Boolean,
+    onWifiQualitySelected: (Int, Int) -> Unit,
+    onMobileQualitySelected: (Int, Int) -> Unit,
+    onWifiDownloadSelected: (Int, Int) -> Unit,
+    onMobileDownloadSelected: (Int, Int) -> Unit,
+    onAllowHighResContentChanged: (Boolean) -> Unit
 ) {
-    val qualityOptions = listOf(
-        4320 to "Best Available",
-        2160 to "2160p (4K)",
-        1440 to "1440p (2K)",
-        1080 to "1080p",
-        720 to "720p",
-        480 to "480p",
-        360 to "360p",
-        240 to "240p",
-        144 to "144p"
-    )
+    val streamOptions = streamQualityOptions(allowHighResContent)
+    val downloadOptions = downloadQualityOptions(allowHighResContent)
 
     var wifiStreamExpanded by remember { mutableStateOf(false) }
     var wifiDownloadExpanded by remember { mutableStateOf(false) }
     var mobileStreamExpanded by remember { mutableStateOf(false) }
     var mobileDownloadExpanded by remember { mutableStateOf(false) }
 
-    val wifiStreamLabel = qualityOptions.firstOrNull { it.first == wifiQualityHeight }?.second ?: "${wifiQualityHeight}p"
-    val wifiDownloadLabel = qualityOptions.firstOrNull { it.first == wifiDownloadHeight }?.second ?: "${wifiDownloadHeight}p"
-    val mobileStreamLabel = qualityOptions.firstOrNull { it.first == mobileQualityHeight }?.second ?: "${mobileQualityHeight}p"
-    val mobileDownloadLabel = qualityOptions.firstOrNull { it.first == mobileDownloadHeight }?.second ?: "${mobileDownloadHeight}p"
+    fun labelFor(options: List<QualityOption>, height: Int, fps: Int): String {
+        val normalizedHeight = if (!allowHighResContent && height > 1080) 1080 else height
+        return options.firstOrNull { it.height == normalizedHeight && it.fps == fps }?.label
+            ?: when {
+                normalizedHeight <= 0 -> "Auto"
+                else -> "${normalizedHeight}p" + if (fps >= 60) " 60fps" else ""
+            }
+    }
+
+    val wifiStreamLabel = labelFor(streamOptions, wifiQualityHeight, wifiStreamTargetFps)
+    val wifiDownloadLabel = labelFor(downloadOptions, wifiDownloadHeight, wifiDownloadTargetFps)
+    val mobileStreamLabel = labelFor(streamOptions, mobileQualityHeight, mobileStreamTargetFps)
+    val mobileDownloadLabel = labelFor(downloadOptions, mobileDownloadHeight, mobileDownloadTargetFps)
 
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
@@ -436,10 +493,31 @@ fun QualitySettingsCard(
                 style = MaterialTheme.typography.titleMedium
             )
             SettingsText(
-                text = "Configure max resolution for streaming and downloads across Wi-Fi and Mobile Data.",
+                text = "Stream supports Auto based on connection speed. Downloads use the exact resolution and frame rate selected.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    SettingsText(
+                        text = "Allow 2K / 4K",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    SettingsText(
+                        text = "Offer 1440p and 2160p options for streams and downloads",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = allowHighResContent,
+                    onCheckedChange = onAllowHighResContentChanged
+                )
+            }
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
@@ -468,11 +546,18 @@ fun QualitySettingsCard(
                             }
                             Box(modifier = Modifier.align(Alignment.TopEnd).padding(top = 40.dp).zIndex(2f)) {
                                 InlineMenu(expanded = wifiStreamExpanded, onDismiss = { wifiStreamExpanded = false }) {
-                                    qualityOptions.forEach { (height, label) ->
+                                    streamOptions.forEach { option ->
                                         DropdownMenuItem(
-                                            text = { SettingsText(label, style = MaterialTheme.typography.bodySmall) },
-                                            onClick = { onWifiQualitySelected(height); wifiStreamExpanded = false },
-                                            trailingIcon = { if (height == wifiQualityHeight) Icon(Icons.Default.Check, contentDescription = null) }
+                                            text = { SettingsText(option.label, style = MaterialTheme.typography.bodySmall) },
+                                            onClick = {
+                                                onWifiQualitySelected(option.height, option.fps)
+                                                wifiStreamExpanded = false
+                                            },
+                                            trailingIcon = {
+                                                if (option.height == wifiQualityHeight && option.fps == wifiStreamTargetFps) {
+                                                    Icon(Icons.Default.Check, contentDescription = null)
+                                                }
+                                            }
                                         )
                                     }
                                 }
@@ -492,11 +577,18 @@ fun QualitySettingsCard(
                             }
                             Box(modifier = Modifier.align(Alignment.TopEnd).padding(top = 40.dp).zIndex(2f)) {
                                 InlineMenu(expanded = wifiDownloadExpanded, onDismiss = { wifiDownloadExpanded = false }) {
-                                    qualityOptions.forEach { (height, label) ->
+                                    downloadOptions.forEach { option ->
                                         DropdownMenuItem(
-                                            text = { SettingsText(label, style = MaterialTheme.typography.bodySmall) },
-                                            onClick = { onWifiDownloadSelected(height); wifiDownloadExpanded = false },
-                                            trailingIcon = { if (height == wifiDownloadHeight) Icon(Icons.Default.Check, contentDescription = null) }
+                                            text = { SettingsText(option.label, style = MaterialTheme.typography.bodySmall) },
+                                            onClick = {
+                                                onWifiDownloadSelected(option.height, option.fps)
+                                                wifiDownloadExpanded = false
+                                            },
+                                            trailingIcon = {
+                                                if (option.height == wifiDownloadHeight && option.fps == wifiDownloadTargetFps) {
+                                                    Icon(Icons.Default.Check, contentDescription = null)
+                                                }
+                                            }
                                         )
                                     }
                                 }
@@ -528,11 +620,18 @@ fun QualitySettingsCard(
                             }
                             Box(modifier = Modifier.align(Alignment.TopEnd).padding(top = 40.dp).zIndex(2f)) {
                                 InlineMenu(expanded = mobileStreamExpanded, onDismiss = { mobileStreamExpanded = false }) {
-                                    qualityOptions.forEach { (height, label) ->
+                                    streamOptions.forEach { option ->
                                         DropdownMenuItem(
-                                            text = { SettingsText(label, style = MaterialTheme.typography.bodySmall) },
-                                            onClick = { onMobileQualitySelected(height); mobileStreamExpanded = false },
-                                            trailingIcon = { if (height == mobileQualityHeight) Icon(Icons.Default.Check, contentDescription = null) }
+                                            text = { SettingsText(option.label, style = MaterialTheme.typography.bodySmall) },
+                                            onClick = {
+                                                onMobileQualitySelected(option.height, option.fps)
+                                                mobileStreamExpanded = false
+                                            },
+                                            trailingIcon = {
+                                                if (option.height == mobileQualityHeight && option.fps == mobileStreamTargetFps) {
+                                                    Icon(Icons.Default.Check, contentDescription = null)
+                                                }
+                                            }
                                         )
                                     }
                                 }
@@ -552,11 +651,18 @@ fun QualitySettingsCard(
                             }
                             Box(modifier = Modifier.align(Alignment.TopEnd).padding(top = 40.dp).zIndex(2f)) {
                                 InlineMenu(expanded = mobileDownloadExpanded, onDismiss = { mobileDownloadExpanded = false }) {
-                                    qualityOptions.forEach { (height, label) ->
+                                    downloadOptions.forEach { option ->
                                         DropdownMenuItem(
-                                            text = { SettingsText(label, style = MaterialTheme.typography.bodySmall) },
-                                            onClick = { onMobileDownloadSelected(height); mobileDownloadExpanded = false },
-                                            trailingIcon = { if (height == mobileDownloadHeight) Icon(Icons.Default.Check, contentDescription = null) }
+                                            text = { SettingsText(option.label, style = MaterialTheme.typography.bodySmall) },
+                                            onClick = {
+                                                onMobileDownloadSelected(option.height, option.fps)
+                                                mobileDownloadExpanded = false
+                                            },
+                                            trailingIcon = {
+                                                if (option.height == mobileDownloadHeight && option.fps == mobileDownloadTargetFps) {
+                                                    Icon(Icons.Default.Check, contentDescription = null)
+                                                }
+                                            }
                                         )
                                     }
                                 }

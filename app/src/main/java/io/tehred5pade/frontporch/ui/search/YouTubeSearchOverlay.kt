@@ -51,6 +51,10 @@ import dev.chrisbanes.haze.HazeStyle
 import kotlinx.coroutines.delay
 import okhttp3.OkHttpClient
 
+private const val SEARCH_CHUNK_SIZE = 5
+private const val SEARCH_CHUNK_DELAY_MS = 80L
+private const val SEARCH_PREFETCH_THRESHOLD = 8
+
 @Composable
 fun FrostedTopSearchBar(
     query: String,
@@ -263,7 +267,8 @@ fun YouTubeSearchResultsScreen(
     var selectedSort by remember { mutableStateOf(SearchSort.RELEVANCE) }
     var sortMenuExpanded by remember { mutableStateOf(false) }
 
-    val results = remember { mutableStateListOf<YouTubeSearchResult>() }
+    val allResults = remember { mutableStateListOf<YouTubeSearchResult>() }
+    var visibleCount by remember { mutableIntStateOf(0) }
     var continuationToken by remember { mutableStateOf<String?>(null) }
     var isInitialLoading by remember { mutableStateOf(false) }
     var isLoadingMore by remember { mutableStateOf(false) }
@@ -271,6 +276,12 @@ fun YouTubeSearchResultsScreen(
     // Bumped after every page so the load-more effect re-evaluates even when the
     // next continuation token is unchanged or the user hasn't moved the list.
     var loadMoreTick by remember { mutableIntStateOf(0) }
+
+    // Only this prefix is rendered. Growing it a few rows at a time makes each fetched
+    // page appear as a small, smooth chunk instead of popping in all at once.
+    val visibleResults by remember {
+        derivedStateOf { allResults.take(visibleCount.coerceAtMost(allResults.size)) }
+    }
 
     BackHandler(enabled = handleBack) { onDismiss() }
 
@@ -281,7 +292,7 @@ fun YouTubeSearchResultsScreen(
         loadMoreTick++
 
         if (query.isBlank()) {
-            results.clear()
+            allResults.clear()
             continuationToken = null
             isInitialLoading = false
             return@LaunchedEffect
@@ -300,21 +311,36 @@ fun YouTubeSearchResultsScreen(
         )
         if (generation != searchGeneration) return@LaunchedEffect
 
-        results.clear()
-        results.addAll(firstPage.items)
+        allResults.clear()
+        allResults.addAll(firstPage.items)
         continuationToken = firstPage.continuationToken
         isInitialLoading = false
         listState.scrollToItem(0)
+        visibleCount = SEARCH_CHUNK_SIZE.coerceAtMost(allResults.size)
         loadMoreTick++
     }
 
-    // Queue the next page once the user is within four items of the bottom.
+    // Reveal newly fetched items in small chunks. Restarted whenever a page is appended
+    // or the query changes so an old reveal loop can't grow the new result set.
+    LaunchedEffect(allResults.size, searchGeneration) {
+        val generation = searchGeneration
+        while (visibleCount < allResults.size && generation == searchGeneration) {
+            delay(SEARCH_CHUNK_DELAY_MS)
+            visibleCount = (visibleCount + SEARCH_CHUNK_SIZE).coerceAtMost(allResults.size)
+        }
+    }
+
+    // Queue the next page once the user is within four items of the bottom, or once the
+    // revealed prefix is close to the fetched edge so chunks keep flowing ahead of scroll.
     val shouldLoadMore by remember {
         derivedStateOf {
             val layoutInfo = listState.layoutInfo
             val totalItems = layoutInfo.totalItemsCount
             val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            totalItems > 0 && lastVisible >= totalItems - 4
+            val nearBottom = totalItems > 0 && lastVisible >= totalItems - 4
+            val nearFetchedEdge = allResults.isNotEmpty() &&
+                visibleCount >= allResults.size - SEARCH_PREFETCH_THRESHOLD
+            nearBottom || nearFetchedEdge
         }
     }
 
@@ -327,7 +353,7 @@ fun YouTubeSearchResultsScreen(
         if (!shouldLoadMore || token.isNullOrBlank() || isInitialLoading || isLoadingMore) return@LaunchedEffect
 
         val generation = searchGeneration
-        val seenBefore = results.size
+        val seenBefore = allResults.size
         isLoadingMore = true
         try {
             val nextPage = searchRepo.searchNextPage(
@@ -336,9 +362,9 @@ fun YouTubeSearchResultsScreen(
             )
             if (generation != searchGeneration) return@LaunchedEffect
 
-            val existingKeys = results.map { "${it::class.simpleName}_${it.id}" }.toSet()
+            val existingKeys = allResults.map { "${it::class.simpleName}_${it.id}" }.toSet()
             val freshItems = nextPage.items.filter { "${it::class.simpleName}_${it.id}" !in existingKeys }
-            results.addAll(freshItems)
+            allResults.addAll(freshItems)
             continuationToken = if (freshItems.isEmpty() && nextPage.continuationToken == token) {
                 null
             } else {
@@ -347,7 +373,7 @@ fun YouTubeSearchResultsScreen(
             // If nothing visibly extended the list but more pages exist (e.g. a shelf-only
             // continuation or an all-duplicate batch), loop immediately while still near
             // the bottom so results keep flowing without a scroll-back nudge.
-            if (continuationToken != null && results.size == seenBefore) {
+            if (continuationToken != null && allResults.size == seenBefore) {
                 loadMoreTick++
             }
         } finally {
@@ -402,6 +428,8 @@ fun YouTubeSearchResultsScreen(
                     InlineMenu(
                         expanded = sortMenuExpanded,
                         onDismiss = { sortMenuExpanded = false },
+                        hazeState = hazeState,
+                        glassStyle = glassStyle,
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .padding(top = 44.dp)
@@ -451,7 +479,7 @@ fun YouTubeSearchResultsScreen(
         Spacer(modifier = Modifier.height(6.dp))
 
         when {
-            isInitialLoading -> {
+            isInitialLoading && allResults.isEmpty() -> {
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
@@ -462,7 +490,7 @@ fun YouTubeSearchResultsScreen(
                 }
             }
 
-            query.isNotBlank() && results.isEmpty() -> {
+            query.isNotBlank() && !isInitialLoading && allResults.isEmpty() -> {
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
@@ -489,7 +517,16 @@ fun YouTubeSearchResultsScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    items(results, key = { "${it::class.simpleName}_${it.id}" }) { item ->
+                    if (isInitialLoading) {
+                        item(key = "search_initial_loading") {
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 8.dp)
+                            )
+                        }
+                    }
+                    items(visibleResults, key = { "${it::class.simpleName}_${it.id}" }) { item ->
                         when (item) {
                             is YouTubeSearchResult.Video -> {
                                 SearchVideoRow(

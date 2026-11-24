@@ -25,6 +25,9 @@ import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.ui.downloads.DownloadQuality
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.atomic.AtomicInteger
 import okhttp3.Call
 import okhttp3.Response
 import okhttp3.MediaType.Companion.toMediaType
@@ -44,9 +47,11 @@ import org.schabi.newpipe.extractor.localization.Localization
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 data class ActiveDownloadItem(
     val videoId: String,
@@ -100,6 +105,43 @@ private fun Call.executeCancellable(cancellation: DownloadCancellation): Respons
     } finally {
         cancellation.unregister(this)
     }
+}
+
+/**
+ * Progress callbacks fire on every network buffer. Without throttling, a fast download
+ * triggers hundreds of StateFlow emissions per second, each rebuilding and reposting the
+ * foreground notification on the main thread. That overhead itself became a bottleneck.
+ */
+private class ThrottledProgress(
+    private val intervalMs: Long = 250L,
+    private val onReport: (Float, Long) -> Unit
+) {
+    private val lastReportMs = AtomicLong(0L)
+    private val lastBytes = AtomicLong(0L)
+    @Volatile private var lastSpeedBps = 0L
+
+    fun report(fraction: Float, bytes: Long) {
+        val now = System.currentTimeMillis()
+        val previous = lastReportMs.get()
+        if (now - previous >= intervalMs && lastReportMs.compareAndSet(previous, now)) {
+            val elapsedMs = (now - previous).coerceAtLeast(1L)
+            val deltaBytes = (bytes - lastBytes.getAndSet(bytes)).coerceAtLeast(0L)
+            lastSpeedBps = deltaBytes * 1000L / elapsedMs
+            onReport(fraction.coerceIn(0f, 1f), lastSpeedBps)
+        }
+    }
+
+    fun finish(bytes: Long) {
+        lastReportMs.set(System.currentTimeMillis())
+        lastBytes.set(bytes)
+        onReport(1f, lastSpeedBps)
+    }
+}
+
+private fun formatSpeed(bytesPerSecond: Long): String = when {
+    bytesPerSecond >= 1_000_000 -> "%.1f MB/s".format(bytesPerSecond / 1_000_000f)
+    bytesPerSecond >= 1_000 -> "%.0f KB/s".format(bytesPerSecond / 1_000f)
+    else -> "$bytesPerSecond B/s"
 }
 
 data class VideoFormatCandidate(
@@ -156,6 +198,69 @@ fun selectBestVideoFormat(
     )
 }
 
+/**
+ * Converts the H.264/MP4 streams NewPipe can actually resolve into picker options. A 60fps
+ * option is added only when a stream at that height really reports ~60fps; a 30fps option is
+ * added only when a 30fps stream exists. Heights the picker has no label for still remain
+ * available through the "Best Available" entries.
+ */
+private fun availableDownloadQualitiesFrom(info: StreamInfo): Set<DownloadQuality> {
+    val result = mutableSetOf<DownloadQuality>()
+
+    val hasAudio = info.audioStreams.any {
+        it.format == NewPipeMediaFormat.M4A && !it.url.isNullOrBlank()
+    }
+    if (hasAudio) result += DownloadQuality.AUDIO_ONLY
+
+    val videoStreams = info.videoStreams.filter {
+        it.format == NewPipeMediaFormat.MPEG_4 && it.height > 0 && !it.url.isNullOrBlank()
+    } + info.videoOnlyStreams.filter {
+        it.format == NewPipeMediaFormat.MPEG_4 &&
+            it.codec.orEmpty().startsWith("avc", ignoreCase = true) &&
+            it.height > 0 &&
+            !it.url.isNullOrBlank()
+    }
+    if (videoStreams.isEmpty()) return result
+
+    result += DownloadQuality.BEST_AVAILABLE
+    if (videoStreams.any { it.height <= 1080 }) {
+        result += DownloadQuality.BEST_AVAILABLE_HD
+    }
+
+    // [has 30fps-capable stream, has 60fps-capable stream]
+    val fpsByHeight = mutableMapOf<Int, BooleanArray>()
+    videoStreams.forEach { stream ->
+        val flags = fpsByHeight.getOrPut(stream.height) { booleanArrayOf(false, false) }
+        if (stream.fps >= 55) flags[1] = true else flags[0] = true
+    }
+
+    fpsByHeight.forEach { (height, fpsFlags) ->
+        when (height) {
+            2160 -> {
+                if (fpsFlags[1]) result += DownloadQuality.Q2160P_60FPS
+                if (fpsFlags[0]) result += DownloadQuality.Q2160P_30FPS
+            }
+            1440 -> {
+                if (fpsFlags[1]) result += DownloadQuality.Q1440P_60FPS
+                if (fpsFlags[0]) result += DownloadQuality.Q1440P_30FPS
+            }
+            1080 -> {
+                if (fpsFlags[1]) result += DownloadQuality.Q1080P_60FPS
+                if (fpsFlags[0]) result += DownloadQuality.Q1080P_30FPS
+            }
+            720 -> {
+                if (fpsFlags[1]) result += DownloadQuality.Q720P_60FPS
+                if (fpsFlags[0]) result += DownloadQuality.Q720P_30FPS
+            }
+            480 -> result += DownloadQuality.Q480P
+            360 -> result += DownloadQuality.Q360P
+            240 -> result += DownloadQuality.Q240P
+            144 -> result += DownloadQuality.Q144P
+        }
+    }
+    return result
+}
+
 class VideoDownloadManager(
     private val context: Context,
     private val okHttpClient: OkHttpClient,
@@ -163,6 +268,10 @@ class VideoDownloadManager(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val settingsStore = DownloadSettingsStore(context)
+
+    // Each video can use several parallel connections. Limit simultaneous videos so a
+    // large batch does not saturate the disk/TLS layer and slow every transfer down.
+    private val videoDownloadSlots = Semaphore(2)
 
     @Volatile
     private var newPipeReady = false
@@ -247,7 +356,9 @@ class VideoDownloadManager(
 
         newDownloads.forEach { video ->
             val job = scope.launch {
-                downloadSingle(video, quality, preferredAudioLanguage)
+                videoDownloadSlots.withPermit {
+                    downloadSingle(video, quality, preferredAudioLanguage)
+                }
             }
             downloadJobs[video.videoId] = job
             job.invokeOnCompletion {
@@ -407,6 +518,38 @@ class VideoDownloadManager(
         }
     }
 
+    /**
+     * Probes each video with the same NewPipe path used by the downloader and returns the
+     * intersection of qualities that can actually be downloaded. Empty means the probe failed,
+     * so callers can fall back to the full allowed list instead of offering nothing.
+     */
+    suspend fun probeAvailableDownloadQualities(videos: List<FeedVideoItem>): Set<DownloadQuality> {
+        if (videos.isEmpty()) return emptySet()
+        if (!ensureNewPipeInitialized()) return emptySet()
+
+        val probeSlots = Semaphore(4)
+        val perVideo = withContext(Dispatchers.IO) {
+            coroutineScope {
+                videos.map { video ->
+                    async {
+                        if (!isActive) return@async emptySet<DownloadQuality>()
+                        probeSlots.withPermit {
+                            runCatching {
+                                StreamInfo.getInfo(
+                                    ServiceList.YouTube,
+                                    "https://www.youtube.com/watch?v=${video.videoId}"
+                                )
+                            }.getOrNull()?.let(::availableDownloadQualitiesFrom) ?: emptySet()
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+
+        if (perVideo.any { it.isEmpty() }) return emptySet()
+        return perVideo.reduce { common, next -> common intersect next }
+    }
+
     private fun fetchIosHlsManifest(videoId: String, cancellation: DownloadCancellation): HlsMasterResult? {
         val (sessionVisitor, sessionCookie) = fetchSessionContext(cancellation)
         cancellation.ensureActive()
@@ -499,8 +642,8 @@ class VideoDownloadManager(
             if (quality.audioOnly) {
                 val targetAudio = resolvedStreams.audioUrl ?: resolvedStreams.muxedUrl
                     ?: throw IllegalStateException("No audio stream available")
-                downloadDirectStream(targetAudio, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawAudioFile, cancellation) { p ->
-                    updateProgress(video, quality.label, 0.08f + p * 0.85f, "Downloading audio ${(p * 100).toInt()}%")
+                downloadDirectStream(targetAudio, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawAudioFile, cancellation) { p, speed ->
+                    updateProgress(video, quality.label, 0.08f + p * 0.85f, "Audio ${(p * 100).toInt()}% · ${formatSpeed(speed)}")
                 }
                 cancellation.ensureActive()
                 validateMediaFile(rawAudioFile, audioOnly = true)
@@ -520,12 +663,35 @@ class VideoDownloadManager(
                 return
             }
 
-            val finalTempFile: File = if (resolvedStreams.videoUrl != null && resolvedStreams.audioUrl != null) {
-                downloadDirectStream(resolvedStreams.videoUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawVideoFile, cancellation) { p ->
-                    updateProgress(video, quality.label, 0.08f + p * 0.60f, "Downloading video ${(p * 100).toInt()}%")
+            val adaptiveVideoUrl = resolvedStreams.videoUrl
+            val adaptiveAudioUrl = resolvedStreams.audioUrl
+            val finalTempFile: File = if (adaptiveVideoUrl != null && adaptiveAudioUrl != null) {
+                // 1080p+ has no muxed stream: video and audio are separate files. Download
+                // them concurrently instead of waiting for the whole video first.
+                val videoPct = AtomicInteger(0)
+                val audioPct = AtomicInteger(0)
+                fun reportCombined(speed: Long) {
+                    val fraction = (videoPct.get() + audioPct.get()) / 200f
+                    updateProgress(
+                        video, quality.label,
+                        0.08f + fraction * 0.60f,
+                        "Video + Audio ${(fraction * 100).toInt()}% · ${formatSpeed(speed)}"
+                    )
                 }
-                downloadDirectStream(resolvedStreams.audioUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawAudioFile, cancellation) { p ->
-                    updateProgress(video, quality.label, 0.68f + p * 0.20f, "Downloading audio ${(p * 100).toInt()}%")
+                coroutineScope {
+                    val videoJob = async(Dispatchers.IO) {
+                        downloadDirectStream(adaptiveVideoUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawVideoFile, cancellation) { p, speed ->
+                            videoPct.set((p * 100).toInt())
+                            reportCombined(speed)
+                        }
+                    }
+                    val audioJob = async(Dispatchers.IO) {
+                        downloadDirectStream(adaptiveAudioUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawAudioFile, cancellation) { p, speed ->
+                            audioPct.set((p * 100).toInt())
+                            reportCombined(speed)
+                        }
+                    }
+                    awaitAll(videoJob, audioJob)
                 }
                 val autoSkipCategories = SponsorBlockPreferences.categoryBehaviors.value
                     .filterValues { it == SponsorSkipBehavior.AUTO_SKIP }
@@ -547,8 +713,8 @@ class VideoDownloadManager(
                 remuxTracksToMp4(rawVideoFile, rawAudioFile, tempMuxed, skipSegments, cancellation)
                 tempMuxed
             } else if (resolvedStreams.muxedUrl != null) {
-                downloadDirectStream(resolvedStreams.muxedUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, tempMuxed, cancellation) { p ->
-                    updateProgress(video, quality.label, 0.08f + p * 0.84f, "Downloading ${(p * 100).toInt()}%")
+                downloadDirectStream(resolvedStreams.muxedUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, tempMuxed, cancellation) { p, speed ->
+                    updateProgress(video, quality.label, 0.08f + p * 0.84f, "Video ${(p * 100).toInt()}% · ${formatSpeed(speed)}")
                 }
                 tempMuxed
             } else {
@@ -847,32 +1013,105 @@ class VideoDownloadManager(
         cookieHeader: String?,
         destination: File,
         cancellation: DownloadCancellation,
-        onProgress: (Float) -> Unit
+        onProgress: (Float, Long) -> Unit
     ) = withContext(Dispatchers.IO) {
-        val reqBuilder = Request.Builder().url(url)
-        if (userAgent.isNotBlank()) reqBuilder.header("User-Agent", userAgent)
-        if (!cookieHeader.isNullOrBlank()) reqBuilder.header("Cookie", cookieHeader)
-        val request = reqBuilder.get().build()
+        fun requestFor(range: String? = null): Request {
+            val builder = Request.Builder().url(url)
+            if (userAgent.isNotBlank()) builder.header("User-Agent", userAgent)
+            if (!cookieHeader.isNullOrBlank()) builder.header("Cookie", cookieHeader)
+            if (range != null) builder.header("Range", range)
+            return builder.get().build()
+        }
 
-        okHttpClient.newCall(request).executeCancellable(cancellation).use { response ->
-            if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code} downloading stream")
-            val body = response.body ?: throw IllegalStateException("Empty response body")
-            val totalBytes = body.contentLength().takeIf { it > 0L } ?: 10_000_000L
-            var downloadedBytes = 0L
-
-            body.byteStream().use { input ->
-                FileOutputStream(destination).use { output ->
-                    val buffer = ByteArray(32 * 1024)
-                    var read: Int
-                    while (input.read(buffer).also { read = it } != -1) {
-                        cancellation.ensureActive()
-                        output.write(buffer, 0, read)
-                        downloadedBytes += read.toLong()
-                        onProgress((downloadedBytes.toFloat() / totalBytes.toFloat()).coerceAtMost(0.99f))
-                    }
-                }
+        // A 1-byte range probe tells us whether the CDN supports ranged requests and the
+        // real file size. Most YouTube media hosts do; when they don't we fall back to a
+        // single ordinary GET.
+        var totalBytes = -1L
+        var rangeSupported = false
+        okHttpClient.newCall(requestFor("bytes=0-0")).executeCancellable(cancellation).use { probe ->
+            val contentRange = probe.header("Content-Range")
+            if (probe.code == 206 && contentRange != null) {
+                totalBytes = contentRange.substringAfterLast('/').trim().toLongOrNull() ?: -1L
+                rangeSupported = totalBytes > 0L
             }
         }
+        cancellation.ensureActive()
+
+        if (!rangeSupported || totalBytes < 4L * 1024 * 1024) {
+            // Single stream for small files or hosts that ignore Range. Progress is still
+            // throttled so the UI/notification are not flooded.
+            okHttpClient.newCall(requestFor()).executeCancellable(cancellation).use { response ->
+                if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code} downloading stream")
+                val body = response.body ?: throw IllegalStateException("Empty response body")
+                val expected = body.contentLength().takeIf { it > 0L }
+                    ?: totalBytes.takeIf { it > 0L }
+                    ?: 10_000_000L
+                val progress = ThrottledProgress(onReport = onProgress)
+                var downloaded = 0L
+                body.byteStream().use { input ->
+                    FileOutputStream(destination).use { output ->
+                        val buffer = ByteArray(128 * 1024)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            cancellation.ensureActive()
+                            output.write(buffer, 0, read)
+                            downloaded += read.toLong()
+                            progress.report(downloaded.toFloat() / expected, downloaded)
+                        }
+                    }
+                }
+                progress.finish(downloaded)
+            }
+            return@withContext
+        }
+
+        // Parallel ranged chunks. Each coroutine writes to its own disjoint offset of the
+        // same file via RandomAccessFile, so no merge pass is needed.
+        val chunkCount = 8
+        val chunkSize = totalBytes / chunkCount
+        val progress = ThrottledProgress(onReport = onProgress)
+        val downloaded = AtomicLong(0L)
+
+        destination.parentFile?.mkdirs()
+        RandomAccessFile(destination, "rw").use { it.setLength(totalBytes) }
+
+        coroutineScope {
+            (0 until chunkCount).map { index ->
+                async(Dispatchers.IO) {
+                    val start = index * chunkSize
+                    val end = if (index == chunkCount - 1) totalBytes - 1 else start + chunkSize - 1
+
+                    okHttpClient.newCall(requestFor("bytes=$start-$end"))
+                        .executeCancellable(cancellation).use { response ->
+                            if (response.code != 206) {
+                                throw IllegalStateException("HTTP ${response.code} for range $start-$end")
+                            }
+                            val body = response.body
+                                ?: throw IllegalStateException("Empty response body for range $start-$end")
+
+                            RandomAccessFile(destination, "rw").use { file ->
+                                file.seek(start)
+                                body.byteStream().use { input ->
+                                    val buffer = ByteArray(128 * 1024)
+                                    var read: Int
+                                    var written = 0L
+                                    while (input.read(buffer).also { read = it } != -1) {
+                                        cancellation.ensureActive()
+                                        file.write(buffer, 0, read)
+                                        written += read.toLong()
+                                        val downloadedNow = downloaded.addAndGet(read.toLong())
+                                        progress.report(downloadedNow.toFloat() / totalBytes, downloadedNow)
+                                    }
+                                    if (written != end - start + 1L) {
+                                        throw IllegalStateException("Incomplete chunk $index: $written bytes")
+                                    }
+                                }
+                            }
+                        }
+                }
+            }.awaitAll()
+        }
+        progress.finish(downloaded.get())
     }
 
     private suspend fun httpGetText(url: String, cancellation: DownloadCancellation): String = withContext(Dispatchers.IO) {
@@ -953,7 +1192,7 @@ class VideoDownloadManager(
 
         if (segmentUrls.isEmpty()) {
             // Might be a master manifest or direct media playlist; treat as single file if needed
-            downloadDirectStream(playlistUrl, iosUserAgent, null, outputFile, cancellation, onProgress)
+            downloadDirectStream(playlistUrl, iosUserAgent, null, outputFile, cancellation) { p, _ -> onProgress(p) }
             return@withContext
         }
 
@@ -1053,6 +1292,11 @@ class VideoDownloadManager(
             if (extractorVideo != null && videoTrackIndex >= 0) {
                 var outputPresentationTimeUs = 0L
                 var lastInputTimeUs = 0L
+                // Samples arrive in chronological order, so a single cursor replaces the
+                // old per-sample filter/sumOf scan over every skip segment.
+                val sortedSkips = skipSegments.sortedBy { it.startSec }
+                var skipCursor = 0
+                var cumulativeTrimUs = 0L
 
                 while (true) {
                     cancellation.ensureActive()
@@ -1070,17 +1314,18 @@ class VideoDownloadManager(
                     lastInputTimeUs = info.presentationTimeUs
 
                     val currentSec = info.presentationTimeUs / 1_000_000f
-                    val matchingSkip = skipSegments.firstOrNull { currentSec >= it.startSec && currentSec < it.endSec }
-
-                    if (matchingSkip != null) {
+                    while (skipCursor < sortedSkips.size && sortedSkips[skipCursor].endSec <= currentSec) {
+                        cumulativeTrimUs += ((sortedSkips[skipCursor].endSec - sortedSkips[skipCursor].startSec) * 1_000_000f).toLong()
+                        skipCursor++
+                    }
+                    if (sortedSkips.getOrNull(skipCursor)?.let { currentSec >= it.startSec && currentSec < it.endSec } == true) {
                         // Skip this sample; advance extractor
                         extractorVideo.advance()
                         continue
                     }
 
                     // Adjust timestamps if segments were removed
-                    val trimmedOffsetUs = skipSegments.filter { it.endSec <= currentSec }.sumOf { ((it.endSec - it.startSec) * 1_000_000f).toLong() }
-                    info.presentationTimeUs = (info.presentationTimeUs - trimmedOffsetUs).coerceAtLeast(outputPresentationTimeUs)
+                    info.presentationTimeUs = (info.presentationTimeUs - cumulativeTrimUs).coerceAtLeast(outputPresentationTimeUs)
                     outputPresentationTimeUs = info.presentationTimeUs
 
                     muxer.writeSampleData(videoTrackIndex, buffer, info)
@@ -1091,6 +1336,9 @@ class VideoDownloadManager(
             // Mux audio samples
             if (extractorAudio != null && audioTrackIndex >= 0) {
                 var outputAudioTimeUs = 0L
+                val sortedSkips = skipSegments.sortedBy { it.startSec }
+                var skipCursor = 0
+                var cumulativeTrimUs = 0L
                 while (true) {
                     cancellation.ensureActive()
                     info.offset = 0
@@ -1106,13 +1354,16 @@ class VideoDownloadManager(
                     }
 
                     val currentSec = info.presentationTimeUs / 1_000_000f
-                    if (skipSegments.any { currentSec >= it.startSec && currentSec < it.endSec }) {
+                    while (skipCursor < sortedSkips.size && sortedSkips[skipCursor].endSec <= currentSec) {
+                        cumulativeTrimUs += ((sortedSkips[skipCursor].endSec - sortedSkips[skipCursor].startSec) * 1_000_000f).toLong()
+                        skipCursor++
+                    }
+                    if (sortedSkips.getOrNull(skipCursor)?.let { currentSec >= it.startSec && currentSec < it.endSec } == true) {
                         extractorAudio.advance()
                         continue
                     }
 
-                    val trimmedOffsetUs = skipSegments.filter { it.endSec <= currentSec }.sumOf { ((it.endSec - it.startSec) * 1_000_000f).toLong() }
-                    info.presentationTimeUs = (info.presentationTimeUs - trimmedOffsetUs).coerceAtLeast(outputAudioTimeUs)
+                    info.presentationTimeUs = (info.presentationTimeUs - cumulativeTrimUs).coerceAtLeast(outputAudioTimeUs)
                     outputAudioTimeUs = info.presentationTimeUs
 
                     muxer.writeSampleData(audioTrackIndex, buffer, info)
@@ -1159,7 +1410,9 @@ class VideoDownloadManager(
                 val newDoc = docDir.createFile(mimeType, targetName)
                 if (newDoc != null) {
                     context.contentResolver.openOutputStream(newDoc.uri)?.use { out ->
-                        sourceFile.inputStream().use { it.copyTo(out) }
+                        // SAF writes are another full-file copy; the default 8 KB buffer
+                        // makes this needlessly chatty on a large MP4.
+                        sourceFile.inputStream().use { it.copyTo(out, bufferSize = 256 * 1024) }
                     }
                     return@withContext SavedFileResult(newDoc.uri.toString(), sourceFile.length())
                 }
@@ -1169,7 +1422,7 @@ class VideoDownloadManager(
         // Fallback to standard Environment.DIRECTORY_DOWNLOADS/FrontPorch
         val downloadsDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FrontPorch").apply { mkdirs() }
         val targetFile = File(downloadsDir, targetName)
-        sourceFile.copyTo(targetFile, overwrite = true)
+        sourceFile.copyTo(targetFile, overwrite = true, bufferSize = 256 * 1024)
         SavedFileResult(targetFile.absolutePath, targetFile.length())
     }
 

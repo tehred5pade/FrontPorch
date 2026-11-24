@@ -147,11 +147,13 @@ fun DraggableVideoPlayerOverlay(
     val isPlaying = nowPlaying?.isPlaying ?: true
 
     // Pad the overlay's coordinate space by the status bar so the expanded player
-    // sits below it. The docked mini player still lands in the same absolute spot
+    // sits below it. A small extra portrait gap keeps the video from touching the
+    // status bar; the docked mini player still lands in the same absolute spot
     // because dockedBarTop is measured from this padded height.
     BoxWithConstraints(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
         val screenWidth = maxWidth
         val screenHeight = maxHeight
+        val portraitTopGap = if (isLandscape) 0.dp else 10.dp
 
         val expandedVideoWidth = screenWidth
         val expandedVideoHeight = screenWidth * (9f / 16f)
@@ -180,8 +182,10 @@ fun DraggableVideoPlayerOverlay(
             if (bottomBarHeightPx > 0) bottomBarHeightPx.toDp() else 80.dp
         }
         val dockedBarTop = (screenHeight - measuredNavHeightDp - miniBarHeight).coerceAtLeast(0.dp)
-        val currentBarTop = if (isLandscape) 0.dp else lerp(0.dp, dockedBarTop, p)
-        val travelPx = with(density) { dockedBarTop.toPx().coerceAtLeast(1f) }
+        val currentBarTop = if (isLandscape) 0.dp else lerp(portraitTopGap, dockedBarTop, p)
+        val travelPx = with(density) {
+            (dockedBarTop - portraitTopGap).coerceAtLeast(1.dp).toPx()
+        }
 
         val verticalDragState = rememberDraggableState { deltaPx ->
             if (!isLandscape) {
@@ -215,7 +219,7 @@ fun DraggableVideoPlayerOverlay(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(top = expandedVideoHeight)
+                    .padding(top = expandedVideoHeight + portraitTopGap)
                     .graphicsLayer {
                         alpha = commentsAlpha
                         translationY = p * 180f

@@ -1,6 +1,7 @@
 package io.tehred5pade.frontporch.ui.models
 
 import io.tehred5pade.frontporch.ResolvedStream
+import io.tehred5pade.frontporch.data.innertube.CaptionTrack
 
 data class VideoItem(
     val id: String,
@@ -21,7 +22,9 @@ data class ShortItem(
     val channelTitle: String = "YouTube Creator",
     val videoUrl: String = "",
     val likesCount: String = "",
-    val resolvedStream: ResolvedStream? = null
+    val resolvedStream: ResolvedStream? = null,
+    val resolvedCaptions: List<CaptionTrack> = emptyList(),
+    val channelId: String = ""
 )
 
 data class CommentItem(

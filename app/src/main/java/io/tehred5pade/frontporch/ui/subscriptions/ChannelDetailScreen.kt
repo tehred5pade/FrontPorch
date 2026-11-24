@@ -42,7 +42,9 @@ fun ChannelDetailScreen(
     viewModel: ChannelDetailViewModel,
     watchProgressRepository: WatchProgressRepository,
     onBack: () -> Unit,
-    onVideoClick: (String) -> Unit
+    onVideoClick: (String) -> Unit,
+    isSubscribed: Boolean = false,
+    onToggleSubscribe: () -> Unit = {}
 ) {
     val videos by viewModel.videos.collectAsState()
     val shorts by viewModel.shorts.collectAsState()
@@ -123,6 +125,12 @@ fun ChannelDetailScreen(
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
+                },
+                actions = {
+                    Button(onClick = onToggleSubscribe) {
+                        Text(if (isSubscribed) "Subscribed" else "Subscribe")
+                    }
+                    Spacer(Modifier.width(8.dp))
                 }
             )
         }

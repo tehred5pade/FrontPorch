@@ -4,11 +4,12 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
@@ -20,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
 
@@ -46,7 +46,12 @@ fun VideoPlayerControlsOverlay(
     hasPreviousVideo: Boolean,
     hasNextVideo: Boolean,
     sponsorSegments: List<SponsorSegment>,
-    onToggleControls: () -> Unit,
+    currentQuality: String = "Auto",
+    availableQualities: List<String> = listOf("Auto", "1080p", "720p", "480p", "360p"),
+    currentCaption: String = "Off",
+    availableCaptions: List<String> = listOf("Off", "On", "Auto"),
+    onQualitySelected: (String) -> Unit = {},
+    onCaptionSelected: (String) -> Unit = {},
     onPreviousVideo: () -> Unit,
     onReplay10: () -> Unit,
     onTogglePlayPause: () -> Unit,
@@ -59,14 +64,11 @@ fun VideoPlayerControlsOverlay(
     var isScrubbing by remember { mutableStateOf(false) }
     var scrubFraction by remember { mutableFloatStateOf(0f) }
 
+    // PlayerGestureOverlay already owns tap-to-show/hide controls. Adding another
+    // full-screen tap handler here intercepted taps on the CC/quality buttons and
+    // immediately dismissed their dropdowns.
     Box(
-        modifier = modifier
-            .fillMaxSize()
-            // Keep the tap handler mounted even while controls are hidden so a
-            // single tap on the video always brings the on-screen controls back.
-            .pointerInput(Unit) {
-                detectTapGestures(onTap = { onToggleControls() })
-            }
+        modifier = modifier.fillMaxSize()
     ) {
         AnimatedVisibility(
             visible = visible,
@@ -77,6 +79,91 @@ fun VideoPlayerControlsOverlay(
             Box(
                 modifier = Modifier.fillMaxSize()
             ) {
+                // Top Right Quality Control Overlay
+                var qualityMenuExpanded by remember { mutableStateOf(false) }
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(16.dp)
+                ) {
+                    IconButton(
+                        onClick = { qualityMenuExpanded = true },
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.45f))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.HighQuality,
+                            contentDescription = "Video Quality",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = qualityMenuExpanded,
+                        onDismissRequest = { qualityMenuExpanded = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Quality: $currentQuality") },
+                            onClick = {},
+                            enabled = false
+                        )
+                        HorizontalDivider()
+                        availableQualities.forEach { q ->
+                            DropdownMenuItem(
+                                text = { Text(q) },
+                                onClick = {
+                                    qualityMenuExpanded = false
+                                    onQualitySelected(q)
+                                }
+                            )
+                        }
+                    }
+                }
+
+                // Bottom Right Closed Caption Overlay (above progress bar)
+                var captionMenuExpanded by remember { mutableStateOf(false) }
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 12.dp, bottom = 48.dp)
+                ) {
+                    IconButton(
+                        onClick = { captionMenuExpanded = true },
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.45f))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ClosedCaption,
+                            contentDescription = "Closed Captions",
+                            tint = if (currentCaption != "Off") scheme.primary else Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = captionMenuExpanded,
+                        onDismissRequest = { captionMenuExpanded = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Subtitles / CC") },
+                            onClick = {},
+                            enabled = false
+                        )
+                        HorizontalDivider()
+                        availableCaptions.forEach { cap ->
+                            DropdownMenuItem(
+                                text = { Text(cap) },
+                                onClick = {
+                                    captionMenuExpanded = false
+                                    onCaptionSelected(cap)
+                                }
+                            )
+                        }
+                    }
+                }
                 // Centered transport controls. Play/Pause is pinned to the exact
                 // center; the rest occupy fixed slots so it never shifts when
                 // Previous/Next are unavailable.

@@ -16,11 +16,6 @@ import org.json.JSONObject
 private const val ANTI_SLOP_OPERATORS =
     """-ai -sora -kling -midjourney -runway -veo -luma -"ai generated" -"ai art" -"ai video" -prank -fake"""
 
-private val entryRegex = Regex("""<entry>(.*?)</entry>""", RegexOption.DOT_MATCHES_ALL)
-private val videoIdTagRegex = Regex("""<yt:videoId>([a-zA-Z0-9_-]{11})</yt:videoId>""")
-private val titleTagRegex = Regex("""<title>(.*?)</title>""")
-private val publishedTagRegex = Regex("""<published>(.*?)</published>""")
-
 data class DatedShortItem(
     val item: ShortItem,
     val publishedIso: String
@@ -166,41 +161,103 @@ class InnerTubeShortsService(
         }.getOrDefault(emptyList<ShortItem>() to null)
     }
 
+    /**
+     * Fetches a channel's Shorts via the InnerTube browse API using its VLUUSH playlist.
+     * The old RSS endpoint is deprecated and often returns an empty feed, which made
+     * subscribed channels silently disappear from the mixed Shorts feed.
+     */
     suspend fun fetchChannelShorts(
         channelId: String,
         channelName: String
     ): List<DatedShortItem> = withContext(Dispatchers.IO) {
         runCatching {
-            val shortsPlaylistId = "UUSH" + channelId.removePrefix("UC")
-            val feedUrl = "https://www.youtube.com/feeds/videos.xml?playlist_id=$shortsPlaylistId"
+            if (!channelId.startsWith("UC")) return@runCatching emptyList<DatedShortItem>()
+
+            val clientObj = JSONObject().apply {
+                put("clientName", "ANDROID")
+                put("clientVersion", "20.10.38")
+                put("androidSdkVersion", 35)
+                put("hl", "en")
+                put("gl", "US")
+            }
+            val payloadObj = JSONObject().apply {
+                put("browseId", "VLUUSH" + channelId.removePrefix("UC"))
+                put("context", JSONObject().put("client", clientObj))
+            }
 
             val request = Request.Builder()
-                .url(feedUrl)
+                .url("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")
                 .header("User-Agent", androidUserAgent)
-                .get()
+                .header("X-YouTube-Client-Name", "3")
+                .header("X-YouTube-Client-Version", "20.10.38")
+                .post(payloadObj.toString().toRequestBody("application/json".toMediaType()))
                 .build()
 
-            val xml = okHttpClient.newCall(request).execute().use { it.body?.string().orEmpty() }
-            if (xml.isBlank()) return@runCatching emptyList()
+            val rawJson = okHttpClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return@runCatching emptyList<DatedShortItem>()
+                resp.body?.string().orEmpty()
+            }
+            if (rawJson.isBlank()) return@runCatching emptyList<DatedShortItem>()
 
-            entryRegex.findAll(xml).mapNotNull { match ->
-                val block = match.groupValues[1]
-                val videoId = videoIdTagRegex.find(block)?.groupValues?.getOrNull(1) ?: return@mapNotNull null
-                val rawTitle = titleTagRegex.find(block)?.groupValues?.getOrNull(1).orEmpty()
-                val published = publishedTagRegex.find(block)?.groupValues?.getOrNull(1).orEmpty()
+            val shorts = mutableListOf<ShortItem>()
+            val seen = mutableSetOf<String>()
+            collectChannelShorts(JSONObject(rawJson), channelId, channelName, shorts, seen, 40)
 
-                if (SlopAndClickbaitFilter.isSlopOrClickbait(rawTitle, channelName)) return@mapNotNull null
-
+            val dateFormat = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US)
+            dateFormat.timeZone = java.util.TimeZone.getTimeZone("UTC")
+            val now = System.currentTimeMillis()
+            shorts.mapIndexed { index, item ->
                 DatedShortItem(
-                    item = ShortItem(
-                        id = videoId,
-                        title = rawTitle,
-                        channelTitle = channelName
-                    ),
-                    publishedIso = published
+                    item = item,
+                    // Playlists are newest-first; synthesize descending timestamps so the
+                    // caller's publishedIso sort preserves YouTube's ordering.
+                    publishedIso = dateFormat.format(java.util.Date(now - index * 60_000L))
                 )
-            }.toList()
+            }
         }.getOrDefault(emptyList())
+    }
+
+    private fun collectChannelShorts(
+        node: Any?,
+        channelId: String,
+        channelName: String,
+        out: MutableList<ShortItem>,
+        seen: MutableSet<String>,
+        limit: Int
+    ) {
+        if (out.size >= limit) return
+        when (node) {
+            is JSONObject -> {
+                val renderer = node.optJSONObject("playlistVideoRenderer")
+                    ?: node.optJSONObject("videoRenderer")
+                    ?: node.optJSONObject("gridVideoRenderer")
+                if (renderer != null) {
+                    val videoId = renderer.optString("videoId").orEmpty()
+                    if (videoId.length == 11 && seen.add(videoId)) {
+                        val title = renderer.optJSONObject("title")
+                            ?.optJSONArray("runs")
+                            ?.optJSONObject(0)
+                            ?.optString("text")
+                            .takeUnless { it.isNullOrBlank() }
+                            ?: renderer.optJSONObject("title")?.optString("simpleText")
+                            ?: "Short"
+                        if (!SlopAndClickbaitFilter.isSlopOrClickbait(title, channelName)) {
+                            out.add(ShortItem(id = videoId, title = title, channelTitle = channelName, channelId = channelId))
+                        }
+                    }
+                }
+                val keys = node.keys()
+                while (keys.hasNext() && out.size < limit) {
+                    collectChannelShorts(node.get(keys.next()), channelId, channelName, out, seen, limit)
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until node.length()) {
+                    if (out.size >= limit) break
+                    collectChannelShorts(node.get(i), channelId, channelName, out, seen, limit)
+                }
+            }
+        }
     }
 
     suspend fun fetchSimilarChannelShorts(
@@ -260,8 +317,26 @@ class InnerTubeShortsService(
                             ?: node.optJSONObject("owner")?.optJSONObject("title")?.optJSONArray("runs")?.optJSONObject(0)?.optString("text")
                             ?: node.optJSONObject("shortBylineText")?.optJSONArray("runs")?.optJSONObject(0)?.optString("text")
                             ?: ""
+                        val channelId = node.optJSONObject("owner")
+                            ?.optJSONObject("navigationEndpoint")
+                            ?.optJSONObject("browseEndpoint")
+                            ?.optString("browseId")
+                            .takeUnless { it.isNullOrBlank() }
+                            ?: node.optJSONObject("shortBylineText")
+                                ?.optJSONArray("runs")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("navigationEndpoint")
+                                ?.optJSONObject("browseEndpoint")
+                                ?.optString("browseId").orEmpty()
                         if (!SlopAndClickbaitFilter.isSlopOrClickbait(title, channelName)) {
-                            out.add(ShortItem(id = videoId, title = title))
+                            out.add(
+                                ShortItem(
+                                    id = videoId,
+                                    title = title,
+                                    channelTitle = channelName.ifBlank { "YouTube Creator" },
+                                    channelId = channelId
+                                )
+                            )
                         }
                     }
                 }

@@ -150,13 +150,21 @@ class DownloadForegroundService : Service() {
             .setProgress(100, overallProgress, false)
             .build()
 
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            notification,
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-        )
-        foregroundStarted = true
+        if (foregroundStarted) {
+            // Re-calling startForeground for every progress tick is an expensive binder
+            // round trip to system_server. Once the service is foregrounded, a normal
+            // notify updates the same notification far more cheaply.
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(NOTIFICATION_ID, notification)
+        } else {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+            foregroundStarted = true
+        }
     }
 
     private fun stopForegroundAndSelf() {

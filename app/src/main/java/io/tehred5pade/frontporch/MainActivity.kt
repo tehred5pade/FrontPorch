@@ -80,6 +80,10 @@ import io.tehred5pade.frontporch.ui.common.frostedGlass
 import io.tehred5pade.frontporch.ui.downloads.DownloadQuality
 import io.tehred5pade.frontporch.ui.downloads.DownloadsScreen
 import io.tehred5pade.frontporch.ui.feed.FeedScreen
+import io.tehred5pade.frontporch.ui.feed.FeedSelectionBar
+import io.tehred5pade.frontporch.ui.feed.FeedSelectionBarState
+import io.tehred5pade.frontporch.ui.feed.FeedVideoMenuOverlay
+import io.tehred5pade.frontporch.ui.feed.FeedVideoMenuState
 import io.tehred5pade.frontporch.ui.feed.FeedViewModel
 import io.tehred5pade.frontporch.ui.player.DraggableVideoPlayerOverlay
 import io.tehred5pade.frontporch.ui.player.FloatingVideoWindow
@@ -101,6 +105,9 @@ import io.tehred5pade.frontporch.ui.subscriptions.ChannelListScreen
 import io.tehred5pade.frontporch.ui.theme.FrontPorchTheme
 import io.tehred5pade.frontporch.ui.theme.rememberMusicastGlassStyle
 import io.tehred5pade.frontporch.ui.theme.ThemePreferences
+import io.tehred5pade.frontporch.update.AppUpdater
+import io.tehred5pade.frontporch.update.ReleaseInfo
+import io.tehred5pade.frontporch.update.UpdateCheckResult
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -180,6 +187,18 @@ class MainActivity : ComponentActivity() {
             val playlistStore = remember(context) { PlaylistStore(context) }
             var downloadSortNewestFirst by rememberSaveable {
                 mutableStateOf(downloadSettingsStore.getSortNewestFirst())
+            }
+
+            // Automatic update check on launch. Only a newer GitHub release is surfaced;
+            // being up to date stays silent so startup isn't interrupted every time.
+            var startupUpdate by remember { mutableStateOf<ReleaseInfo?>(null) }
+            LaunchedEffect(Unit) {
+                if (!AppUpdater.isAutoCheckEnabled(context)) return@LaunchedEffect
+                when (val result = AppUpdater.checkForUpdates(context)) {
+                    is UpdateCheckResult.UpdateAvailable -> startupUpdate = result.release
+                    is UpdateCheckResult.UpToDate,
+                    is UpdateCheckResult.Error -> Unit // Stay silent at launch.
+                }
             }
             // A newly opened video always starts expanded.
             LaunchedEffect(activeVideo?.videoId) {
@@ -388,7 +407,8 @@ class MainActivity : ComponentActivity() {
                             okHttpClient = app.okHttpClient,
                             shortsService = shortsService,
                             settingsRepository = settingsRepository,
-                            subscriptionDao = subscriptionDao
+                            subscriptionDao = subscriptionDao,
+                            searchRepository = YouTubeSearchRepository(app.okHttpClient)
                         ) as T
                     }
                 }
@@ -458,6 +478,8 @@ class MainActivity : ComponentActivity() {
 
                 val hazeState = remember { HazeState() }
                 var bottomBarHeightPx by remember { mutableIntStateOf(0) }
+                var feedSelectionBar by remember { mutableStateOf<FeedSelectionBarState?>(null) }
+                var feedVideoMenu by remember { mutableStateOf<FeedVideoMenuState?>(null) }
                 val density = LocalDensity.current
                 val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
                 val navBarBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
@@ -520,12 +542,15 @@ class MainActivity : ComponentActivity() {
                                                     )
                                                 },
                                                 onNavigateToSettings = { selectTab(AppTab.SETTINGS.ordinal) },
-                                                topContentPadding = feedTopClearance,
+                                                topContentPadding = feedTopClearance +
+                                                    if (feedSelectionBar != null) 64.dp else 0.dp,
                                                 bottomContentPadding = feedBottomClearance,
                                                 preferredAudioLanguage = userSettings.preferredAudioLanguage,
-                                                defaultDownloadQuality = DownloadQuality.fromMaxHeight(
-                                                    context.currentDownloadMaxHeight(userSettings)
+                                                defaultDownloadQuality = DownloadQuality.fromSettings(
+                                                    context.currentDownloadMaxHeight(userSettings),
+                                                    context.currentDownloadTargetFps(userSettings)
                                                 ).name,
+                                                allowHighResDownloads = userSettings.allowHighResContent,
                                                 playlistStore = playlistStore,
                                                 onPlayPlaylistEntry = { entry -> openPlaylistEntry(entry) },
                                                 onStartBackgroundPlay = { video ->
@@ -546,7 +571,9 @@ class MainActivity : ComponentActivity() {
                                                         PlaybackMode.FLOATING
                                                     )
                                                 },
-                                                onBackOverlayChanged = { key, visible -> setBackOverlay(key, visible) }
+                                                onBackOverlayChanged = { key, visible -> setBackOverlay(key, visible) },
+                                                onSelectionBarStateChanged = { feedSelectionBar = it },
+                                                onVideoMenuStateChanged = { feedVideoMenu = it }
                                             )
 
                                             AppTab.SEARCH -> SearchScreen(
@@ -621,9 +648,34 @@ class MainActivity : ComponentActivity() {
                                                 onLoadMore = { shortsViewModel.loadMoreShorts() },
                                                 onRetry = { shortsViewModel.reloadFeed() },
                                                 onShortViewed = { id -> shortsViewModel.recordShortViewed(id) },
+                                                likedShortIds = userSettings.likedShortIds,
+                                                dislikedShortIds = userSettings.dislikedShortIds,
+                                                onLikeShort = { short -> shortsViewModel.likeShort(short) },
+                                                onDislikeShort = { short -> shortsViewModel.dislikeShort(short) },
                                                 isPageActive = pagerState.currentPage == AppTab.SHORTS.ordinal,
                                                 maxStreamHeight = context.currentStreamMaxHeight(userSettings),
-                                                preferredAudioLanguage = userSettings.preferredAudioLanguage
+                                                streamTargetFps = context.currentStreamTargetFps(userSettings),
+                                                preferredAudioLanguage = userSettings.preferredAudioLanguage,
+                                                subscribedChannelIds = subscriptions.mapTo(HashSet()) { it.channelId },
+                                                onOpenChannel = { channelId, channelTitle ->
+                                                    navController.navigate(
+                                                        "channel/$channelId?name=${Uri.encode(channelTitle)}"
+                                                    )
+                                                },
+                                                onToggleSubscribe = { channelId, channelTitle ->
+                                                    scope.launch {
+                                                        if (channelId in subscriptions.map { it.channelId }) {
+                                                            subscriptionDao.deleteSubscription(channelId)
+                                                        } else {
+                                                            subscriptionDao.insertSubscription(
+                                                                SubscriptionEntity(
+                                                                    channelId = channelId,
+                                                                    name = channelTitle
+                                                                )
+                                                            )
+                                                        }
+                                                    }
+                                                }
                                             )
 
                                             AppTab.SETTINGS -> SettingsScreen(
@@ -656,17 +708,33 @@ class MainActivity : ComponentActivity() {
                                                 onAudioLanguageChanged = { code ->
                                                     scope.launch { settingsRepository.updatePreferredAudioLanguage(code) }
                                                 },
-                                                onWifiQualityChanged = { height ->
-                                                    scope.launch { settingsRepository.updateWifiStreamHeight(height) }
+                                                onWifiQualityChanged = { height, fps ->
+                                                    scope.launch {
+                                                        settingsRepository.updateWifiStreamHeight(height)
+                                                        settingsRepository.updateWifiStreamTargetFps(fps)
+                                                    }
                                                 },
-                                                onMobileQualityChanged = { height ->
-                                                    scope.launch { settingsRepository.updateMobileStreamHeight(height) }
+                                                onMobileQualityChanged = { height, fps ->
+                                                    scope.launch {
+                                                        settingsRepository.updateMobileStreamHeight(height)
+                                                        settingsRepository.updateMobileStreamTargetFps(fps)
+                                                    }
                                                 },
-                                                onWifiDownloadQualityChanged = { height ->
-                                                    scope.launch { settingsRepository.updateWifiDownloadHeight(height) }
+                                                onWifiDownloadQualityChanged = { height, fps ->
+                                                    scope.launch {
+                                                        settingsRepository.updateWifiDownloadHeight(height)
+                                                        settingsRepository.updateWifiDownloadTargetFps(fps)
+                                                    }
                                                 },
-                                                onMobileDownloadQualityChanged = { height ->
-                                                    scope.launch { settingsRepository.updateMobileDownloadHeight(height) }
+                                                onMobileDownloadQualityChanged = { height, fps ->
+                                                    scope.launch {
+                                                        settingsRepository.updateMobileDownloadHeight(height)
+                                                        settingsRepository.updateMobileDownloadTargetFps(fps)
+                                                    }
+                                                },
+                                                allowHighResContent = userSettings.allowHighResContent,
+                                                onAllowHighResContentChanged = { enabled ->
+                                                    scope.launch { settingsRepository.updateAllowHighResContent(enabled) }
                                                 },
                                                 onImportUri = { uri ->
                                                     NewPipeSubscriptionImporter.importFromUri(applicationContext, uri)
@@ -758,6 +826,16 @@ class MainActivity : ComponentActivity() {
                                             onBack = { navController.popBackStack() },
                                             onVideoClick = { videoId ->
                                                 openQueueVideo(QueueVideoItem(videoId, "Video", subscription.name))
+                                            },
+                                            isSubscribed = channelId in subscriptions.map { it.channelId },
+                                            onToggleSubscribe = {
+                                                scope.launch {
+                                                    if (channelId in subscriptions.map { it.channelId }) {
+                                                        subscriptionDao.deleteSubscription(channelId)
+                                                    } else {
+                                                        subscriptionDao.insertSubscription(subscription)
+                                                    }
+                                                }
                                             }
                                         )
                                     }
@@ -797,18 +875,60 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
+                // Feed multi-select bar. It is drawn as a sibling of the haze source,
+                // exactly like the tab bar, so it samples the same content with the same
+                // haze state/style and therefore matches the tab bar and download dialog.
+                val selectionBar = feedSelectionBar
+                if (
+                    selectionBar != null &&
+                    !isWatchRoute &&
+                    tabs.getOrNull(pagerState.currentPage) == AppTab.SUBSCRIPTIONS
+                ) {
+                    FeedSelectionBar(
+                        state = selectionBar,
+                        hazeState = hazeState,
+                        glassStyle = sharedGlassStyle,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = statusBarTop)
+                            .fillMaxWidth()
+                            .zIndex(6f)
+                    )
+                }
+
+                // Feed video action menu. A sibling of the haze source (not a dialog window)
+                // so the scrim cannot blur the feed, and the menu can still sample the feed's
+                // haze state for the same frosted-glass look as the tab bar.
+                val videoMenu = feedVideoMenu
+                if (
+                    videoMenu != null &&
+                    !isWatchRoute &&
+                    tabs.getOrNull(pagerState.currentPage) == AppTab.SUBSCRIPTIONS
+                ) {
+                    FeedVideoMenuOverlay(
+                        state = videoMenu,
+                        hazeState = hazeState,
+                        glassStyle = sharedGlassStyle,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(7f)
+                    )
+                }
+
                 // Search now lives in its own centered tab, Channels is opened from
                 // Settings, and Downloads has its own sort control. No top pill is needed.
 
                 // 3. Frosted tab bar: NavigationRail on right in landscape, NavigationBar on bottom in portrait.
                 if (!isWatchRoute) {
                     if (isLandscape) {
+                        val tabBarAlpha = if (activeVideo == null) 1f else 0f
                         Box(
                             modifier = Modifier
                                 .align(Alignment.CenterEnd)
                                 .fillMaxHeight()
                                 .width(measuredTabBarDp)
-                                .zIndex(3f)
+                                .zIndex(if (activeVideo == null) 3f else -10f)
+                                .graphicsLayer { alpha = tabBarAlpha }
                                 .hazeEffect(state = hazeState, style = sharedGlassStyle)
                                 .background(scheme.surfaceContainer.copy(alpha = 0.62f))
                         ) {
@@ -869,6 +989,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
                                 .fillMaxWidth()
+                                .zIndex(if (activeVideo == null || playerCollapseProgress > 0.3f) 3f else -10f)
                                 .graphicsLayer { alpha = tabBarAlpha }
                                 .onSizeChanged { size ->
                                     if (size.height > 0) bottomBarHeightPx = size.height
@@ -1040,7 +1161,82 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 }
+
+                // Only a newer release is surfaced at launch.
+                startupUpdate?.let { release ->
+                    StartupUpdateDialog(
+                        release = release,
+                        onDismiss = { startupUpdate = null }
+                    )
+                }
             }
         }
     }
+}
+
+/** Dialog shown when the automatic launch check discovers a newer APK on GitHub Releases. */
+@Composable
+private fun StartupUpdateDialog(
+    release: ReleaseInfo,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var isDownloading by remember { mutableStateOf(false) }
+    var progress by remember { mutableFloatStateOf(0f) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = { if (!isDownloading) onDismiss() },
+        title = { Text("Update Available (${release.tagName})") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Installed: v${AppUpdater.getInstalledVersionName(context)} → Latest: ${release.tagName}",
+                    style = MaterialTheme.typography.labelMedium
+                )
+                Text(release.releaseNotes, style = MaterialTheme.typography.bodySmall)
+                if (isDownloading) {
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                error?.let {
+                    Text(
+                        text = it,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !isDownloading,
+                onClick = {
+                    scope.launch {
+                        isDownloading = true
+                        error = null
+                        progress = 0f
+                        AppUpdater.downloadAndInstallApk(context, release.apkDownloadUrl) {
+                            progress = it
+                        }.onFailure {
+                            error = it.message
+                        }.onSuccess {
+                            onDismiss()
+                        }
+                        isDownloading = false
+                    }
+                }
+            ) {
+                Text(if (isDownloading) "Downloading..." else "Download & Install")
+            }
+        },
+        dismissButton = {
+            TextButton(enabled = !isDownloading, onClick = onDismiss) {
+                Text("Later")
+            }
+        }
+    )
 }

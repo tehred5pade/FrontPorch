@@ -12,7 +12,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.unit.dp
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
 
 /**
  * A compact menu drawn in the normal composition instead of a platform popup window.
@@ -23,15 +26,19 @@ fun InlineMenu(
     expanded: Boolean,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
+    hazeState: HazeState? = null,
+    glassStyle: HazeStyle? = null,
+    shape: Shape = RoundedCornerShape(12.dp),
     content: @Composable ColumnScope.() -> Unit
 ) {
     if (!expanded) return
 
     BackHandler { onDismiss() }
 
+    val container = MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.78f)
     Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = shape,
+        color = container,
         tonalElevation = 3.dp,
         shadowElevation = 8.dp,
         modifier = modifier
