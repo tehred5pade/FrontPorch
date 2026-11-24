@@ -93,6 +93,13 @@ class ShortsViewModel(
         return item.channelId.isNotBlank() && item.channelId in settings.blockedShortChannelIds
     }
 
+    /** Central allowlist filter: no blocked/hidden/disliked/slop/clickbait items. */
+    private fun isAllowedShort(item: ShortItem, settings: UserSettings = userSettings.value): Boolean {
+        if (item.id in blockedShortIds) return false
+        if (isHiddenByFeedback(item)) return false
+        return !SlopAndClickbaitFilter.isSlopOrClickbait(item.title, item.channelTitle)
+    }
+
     init {
         // Drop any placeholder-creator Shorts already present from an earlier session.
         _shorts.update { list -> list.filterNot { isBlockedCreator(it) } }
@@ -209,14 +216,23 @@ class ShortsViewModel(
         val settings = userSettings.value
         val raw = runCatching { subscriptionDao.getAllOnce() }.getOrDefault(emptyList())
         val candidates = if (raw.isEmpty()) {
-            val query = selectedCategoryItems().firstOrNull()?.seedQuery?.removeSuffix(" #shorts")
-                ?: "trending"
-            shortsService.searchShortsByQuery(
-                query = "$query #shorts",
-                visitorData = visitorData,
-                paramsOverride = null,
-                preferredAudioLanguage = settings.preferredAudioLanguage
-            ).getOrDefault(emptyList())
+            // No subscriptions: only honor explicitly selected categories and thumbs-up-similar.
+            val categoryItems = selectedCategoryItems()
+            val categoryResults = if (categoryItems.isEmpty()) {
+                emptyList()
+            } else {
+                categoryItems.shuffled().take(2).map { cat ->
+                    async(Dispatchers.IO) {
+                        shortsService.searchShortsByQuery(
+                            query = cat.seedQuery,
+                            visitorData = visitorData,
+                            paramsOverride = null,
+                            preferredAudioLanguage = settings.preferredAudioLanguage
+                        ).getOrDefault(emptyList())
+                    }
+                }.awaitAll().flatten()
+            }
+            categoryResults + fetchLikedSimilarShorts()
         } else {
             raw.shuffled().take(6).map { sub ->
                 async(Dispatchers.IO) {
@@ -228,8 +244,7 @@ class ShortsViewModel(
         }
 
         filterRepeats(candidates, settings.seenShortsTimestamps, settings.repeatCooldown)
-            .filterNot { SlopAndClickbaitFilter.isSlopOrClickbait(it.title, it.channelTitle) }
-            .filterNot { isHiddenByFeedback(it) || it.id in blockedShortIds }
+            .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .shuffled()
             .take(8)
@@ -239,37 +254,26 @@ class ShortsViewModel(
         if (_isLoading.value) return
         viewModelScope.launch {
             _isLoading.value = true
-            val currentList = _shorts.value
-            val existingIds = currentList.mapTo(HashSet()) { it.id }
+            try {
+                val settings = userSettings.value
+                val currentList = _shorts.value
+                val existingIds = currentList.mapTo(HashSet()) { it.id }
 
-            // Keep the configured sources primary when paging. Generic reel sequences
-            // drift away from the user's subscriptions and selected categories.
-            val mixedNew = fetchCombinedShortsBatch()
-                .filterNot { it.id in existingIds || isHiddenByFeedback(it) }
-                .take(12)
-            if (mixedNew.isNotEmpty()) {
-                _shorts.value = currentList + mixedNew
+                // Only use allowed sources: subscriptions, similar-to-subscribed,
+                // selected categories, and thumbs-up-similar. Avoid generic reel drift.
+                val mixedNew = fetchCombinedShortsBatch()
+                    .asSequence()
+                    .filter { it.id !in existingIds }
+                    .filter { isAllowedShort(it, settings) }
+                    .distinctBy { it.id }
+                    .take(12)
+                    .toList()
+                if (mixedNew.isNotEmpty()) {
+                    _shorts.value = currentList + mixedNew
+                }
+            } finally {
                 _isLoading.value = false
-                return@launch
             }
-
-            val seedId = currentList.lastOrNull()?.id
-            val (moreItems, nextToken) = shortsService.fetchReelSequence(
-                seedVideoId = if (continuationToken == null) seedId else null,
-                continuation = continuationToken,
-                visitorData = visitorData,
-                preferredAudioLanguage = userSettings.value.preferredAudioLanguage
-            )
-
-            continuationToken = nextToken
-            val filteredMore = filterRepeats(moreItems, userSettings.value.seenShortsTimestamps, userSettings.value.repeatCooldown)
-            val uniqueNew = filteredMore
-                .filterNot { it.id in existingIds || isHiddenByFeedback(it) || it.id in blockedShortIds }
-                .take(12)
-            if (uniqueNew.isNotEmpty()) {
-                _shorts.value = currentList + uniqueNew
-            }
-            _isLoading.value = false
         }
     }
 
@@ -329,6 +333,7 @@ class ShortsViewModel(
             }
         ).distinctBy { it.lowercase() }.shuffled().take(6)
 
+        val settings = userSettings.value
         val discoveredChannels = seedQueries.map { seed ->
             async {
                 runCatching {
@@ -339,7 +344,7 @@ class ShortsViewModel(
         }.awaitAll()
             .flatten()
             .distinctBy { it.id }
-            .filterNot { it.id in subscribedIds }
+            .filterNot { it.id in subscribedIds || it.id in settings.blockedShortChannelIds }
             .shuffled()
             .take(8)
 
@@ -358,7 +363,8 @@ class ShortsViewModel(
         }.awaitAll().flatten()
 
         (discoveredShorts + relatedReelShorts)
-            .filterNot { SlopAndClickbaitFilter.isSlopOrClickbait(it.title, it.channelTitle) }
+            .filter { isAllowedShort(it, settings) }
+            .filterNot { it.channelId.isNotBlank() && it.channelId in subscribedIds }
             .distinctBy { it.id }
             .shuffled()
     }
@@ -368,17 +374,20 @@ class ShortsViewModel(
      * next batch leans toward videos related to what the user actually liked.
      */
     private suspend fun fetchLikedSimilarShorts(): List<ShortItem> = coroutineScope {
-        userSettings.value.likedShortIds.toList().takeLast(3).map { likedId ->
+        val settings = userSettings.value
+        settings.likedShortIds.toList().takeLast(3).map { likedId ->
             async(Dispatchers.IO) {
                 runCatching {
                     shortsService.fetchReelSequence(
                         seedVideoId = likedId,
                         visitorData = visitorData,
-                        preferredAudioLanguage = userSettings.value.preferredAudioLanguage
+                        preferredAudioLanguage = settings.preferredAudioLanguage
                     ).first
                 }.getOrDefault(emptyList())
             }
         }.awaitAll().flatten()
+            .filter { isAllowedShort(it, settings) }
+            .distinctBy { it.id }
     }
 
     private suspend fun fetchCombinedShortsBatch(): List<ShortItem> = coroutineScope {
@@ -388,10 +397,11 @@ class ShortsViewModel(
         val cooldown = settings.repeatCooldown
 
         if (allSubs.isEmpty()) {
-            val categoryShorts = fetchCategoryBatch()
-            val likedSimilar = fetchLikedSimilarShorts().filterNot { isHiddenByFeedback(it) }
+            // Strict source policy: no subscriptions means only selected categories and liked-similar.
+            val categoryShorts = if (settings.selectedCategoryIds.isNotEmpty()) fetchCategoryBatch() else emptyList()
+            val likedSimilar = fetchLikedSimilarShorts()
             return@coroutineScope (categoryShorts + likedSimilar)
-                .filterNot { isHiddenByFeedback(it) || it.id in blockedShortIds }
+                .filter { isAllowedShort(it, settings) }
                 .distinctBy { it.id }
                 .shuffled()
                 .take(20)
@@ -409,13 +419,13 @@ class ShortsViewModel(
 
         val directSubShorts = subResultsByChannel
             .flatMap { it.second }
-            .filterNot { SlopAndClickbaitFilter.isSlopOrClickbait(it.title, it.channelTitle) }
+            .filter { isAllowedShort(it, settings) }
 
-        // 2. Shorts from similar channels plus the user's selected categories.
+        // 2. Shorts from similar channels, selected categories, and thumbs-up-similar.
         val channelsWithSeeds = subResultsByChannel.filter { it.second.isNotEmpty() }.shuffled().take(4)
         val similarShorts = (fetchSimilarChannelBatch(allSubs, channelsWithSeeds, visitorData) +
             fetchLikedSimilarShorts())
-            .filterNot { SlopAndClickbaitFilter.isSlopOrClickbait(it.title, it.channelTitle) }
+            .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .shuffled()
         val categoryShorts = if (settings.selectedCategoryIds.isNotEmpty()) {
@@ -426,6 +436,7 @@ class ShortsViewModel(
 
         // 3. Apply repeat cooldown and dedupe across sources.
         val freshSubShorts = filterRepeats(directSubShorts, seenMap, cooldown)
+            .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .shuffled()
 
@@ -433,6 +444,7 @@ class ShortsViewModel(
         val likedChannels = settings.likedShortChannelIds
         val freshSimilarShorts = filterRepeats(similarShorts, seenMap, cooldown)
             .filterNot { it.id in subVideoIds }
+            .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .shuffled()
             // Stable sort within the shuffled list: channels the user liked rank first.
@@ -441,6 +453,7 @@ class ShortsViewModel(
         val usedIds = subVideoIds + freshSimilarShorts.mapTo(HashSet()) { it.id }
         val freshCategoryShorts = filterRepeats(categoryShorts, seenMap, cooldown)
             .filterNot { it.id in usedIds }
+            .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .shuffled()
 
@@ -456,18 +469,16 @@ class ShortsViewModel(
             }
         }
 
-        val batch = if (blended.isEmpty()) {
-            fetchCategoryBatch()
-        } else {
-            blended
-        }
-        batch.filterNot { isHiddenByFeedback(it) || it.id in blockedShortIds }
+        blended
+            .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .take(20)
     }
 
     private suspend fun fetchCategoryBatch(): List<ShortItem> = coroutineScope {
+        val settings = userSettings.value
         val activeSelectedCategories = selectedCategoryItems()
+        if (activeSelectedCategories.isEmpty()) return@coroutineScope emptyList()
 
         val modifiers = listOf(
             "" to null,
@@ -478,14 +489,8 @@ class ShortsViewModel(
         val (suffix, sortParam) = modifiers[batchGeneration % modifiers.size]
         batchGeneration++
 
-        val baseQueries = if (activeSelectedCategories.isNotEmpty()) {
-            activeSelectedCategories.map { it.seedQuery }
-        } else {
-            listOf("trending #shorts")
-        }
-
-        val queries = baseQueries.map { catQuery ->
-            val cleanBase = catQuery.removeSuffix(" #shorts")
+        val queries = activeSelectedCategories.map { cat ->
+            val cleanBase = cat.seedQuery.removeSuffix(" #shorts")
             if (suffix.isEmpty()) "$cleanBase #shorts" else "$cleanBase $suffix #shorts"
         }
 
@@ -496,7 +501,7 @@ class ShortsViewModel(
                         query = query,
                         visitorData = visitorData,
                         paramsOverride = sortParam,
-                        preferredAudioLanguage = userSettings.value.preferredAudioLanguage
+                        preferredAudioLanguage = settings.preferredAudioLanguage
                     )
                         .onFailure { _errorMessage.value = it.message }
                         .getOrDefault(emptyList())
@@ -504,23 +509,12 @@ class ShortsViewModel(
             }
             .awaitAll()
             .flatten()
+            .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .shuffled()
 
-        val filtered = filterRepeats(searchResults, userSettings.value.seenShortsTimestamps, userSettings.value.repeatCooldown)
-
-        val seedId = filtered.firstOrNull()?.id ?: searchResults.firstOrNull()?.id
-        val results = if (seedId != null) {
-            val (reelItems, nextToken) = shortsService.fetchReelSequence(
-                seedVideoId = seedId,
-                visitorData = visitorData,
-                preferredAudioLanguage = userSettings.value.preferredAudioLanguage
-            )
-            continuationToken = nextToken
-            (filtered + reelItems).distinctBy { it.id }
-        } else {
-            filtered
-        }
-        results
+        filterRepeats(searchResults, settings.seenShortsTimestamps, settings.repeatCooldown)
+            .filter { isAllowedShort(it, settings) }
+            .distinctBy { it.id }
     }
 }

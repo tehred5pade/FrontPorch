@@ -104,6 +104,7 @@ fun SettingsScreen(
     onImportUri: suspend (Uri) -> Result<Int> = { Result.success(0) },
     topContentPadding: Dp = 0.dp,
     bottomContentPadding: Dp = 0.dp,
+    endContentPadding: Dp = 0.dp,
     onBackOverlayChanged: (String, Boolean) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
@@ -137,7 +138,7 @@ fun SettingsScreen(
         state = listState,
         contentPadding = PaddingValues(
             start = 16.dp,
-            end = 16.dp,
+            end = 16.dp + endContentPadding,
             top = topContentPadding,
             bottom = bottomContentPadding
         ),

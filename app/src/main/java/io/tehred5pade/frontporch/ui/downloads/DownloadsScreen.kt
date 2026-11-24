@@ -949,15 +949,17 @@ fun OfflineVideoPlayer(
     }
 
     // Poll progress, skip sponsor segments, and trigger the watched checkmark
+    val latestShowControls by rememberUpdatedState(showControls)
+    val latestIsScrubbing by rememberUpdatedState(isScrubbing)
     LaunchedEffect(exoPlayer, currentVideo.videoId, activeOfflineSegments, categoryBehaviors, sponsorBlockEnabled) {
         while (true) {
-            delay(200L)
+            delay(if (latestShowControls || latestIsScrubbing) 200L else 500L)
             val posMs = exoPlayer.currentPosition.coerceAtLeast(0L)
             val durMs = exoPlayer.duration.takeIf { it > 0L } ?: (currentVideo.durationSeconds.toLong() * 1000L)
             currentSeconds = posMs / 1000L
             durationSeconds = durMs / 1000L
 
-            if (!isScrubbing && durMs > 0L) {
+            if ((latestShowControls || latestIsScrubbing) && !latestIsScrubbing && durMs > 0L) {
                 scrubFraction = (posMs.toFloat() / durMs.toFloat()).coerceIn(0f, 1f)
             }
 
@@ -1037,7 +1039,7 @@ fun OfflineVideoPlayer(
     ) {
         AndroidView(
             factory = { ctx ->
-                (LayoutInflater.from(ctx).inflate(R.layout.view_video_player, null) as PlayerView).apply {
+                (LayoutInflater.from(ctx).inflate(R.layout.view_offline_video_player, null) as PlayerView).apply {
                     player = exoPlayer
                     useController = false
                     keepScreenOn = true
@@ -1076,46 +1078,6 @@ fun OfflineVideoPlayer(
                         .fillMaxSize()
                         .background(Color.Black.copy(alpha = 0.45f))
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .statusBarsPadding()
-                            .padding(16.dp)
-                            .align(Alignment.TopCenter)
-                    ) {
-                        IconButton(
-                            onClick = onClose,
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(CircleShape)
-                                .background(Color.Black.copy(alpha = 0.6f))
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Close,
-                                contentDescription = "Close player",
-                                tint = Color.White
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = currentVideo.title,
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = currentVideo.channelName,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.White.copy(alpha = 0.7f),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-
                     IconButton(
                         onClick = {
                             if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
@@ -1173,6 +1135,48 @@ fun OfflineVideoPlayer(
                             }
                         )
                     }
+                }
+            }
+
+            // Always show title so the user knows what is playing, even when controls hide.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter)
+                    .background(Color.Black.copy(alpha = if (showControls) 0f else 0.35f))
+                    .statusBarsPadding()
+                    .padding(16.dp)
+            ) {
+                IconButton(
+                    onClick = onClose,
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.6f))
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Close,
+                        contentDescription = "Close player",
+                        tint = Color.White
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = currentVideo.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color.White,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = currentVideo.channelName,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         }

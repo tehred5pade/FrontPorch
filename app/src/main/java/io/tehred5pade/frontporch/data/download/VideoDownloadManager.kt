@@ -271,7 +271,7 @@ class VideoDownloadManager(
 
     // Each video can use several parallel connections. Limit simultaneous videos so a
     // large batch does not saturate the disk/TLS layer and slow every transfer down.
-    private val videoDownloadSlots = Semaphore(2)
+    private val videoDownloadSlots = Semaphore(3)
 
     @Volatile
     private var newPipeReady = false
@@ -678,7 +678,26 @@ class VideoDownloadManager(
                         "Video + Audio ${(fraction * 100).toInt()}% · ${formatSpeed(speed)}"
                     )
                 }
-                coroutineScope {
+                val autoSkipCategories = SponsorBlockPreferences.categoryBehaviors.value
+                    .filterValues { it == SponsorSkipBehavior.AUTO_SKIP }
+                    .keys
+                    .filter { it != SponsorCategory.POI_HIGHLIGHT }
+                    .map { it.apiKey }
+
+                val skipSegments = coroutineScope {
+                    val sponsorJob = async(Dispatchers.IO) {
+                        if (SponsorBlockPreferences.isEnabled.value && autoSkipCategories.isNotEmpty()) {
+                            runCatching {
+                                fetchSponsorBlockSegmentsUs(
+                                    videoId = video.videoId,
+                                    categories = autoSkipCategories,
+                                    cancellation = cancellation
+                                )
+                            }.getOrDefault(emptyList())
+                        } else {
+                            emptyList()
+                        }
+                    }
                     val videoJob = async(Dispatchers.IO) {
                         downloadDirectStream(adaptiveVideoUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawVideoFile, cancellation) { p, speed ->
                             videoPct.set((p * 100).toInt())
@@ -692,23 +711,9 @@ class VideoDownloadManager(
                         }
                     }
                     awaitAll(videoJob, audioJob)
+                    sponsorJob.await()
                 }
-                val autoSkipCategories = SponsorBlockPreferences.categoryBehaviors.value
-                    .filterValues { it == SponsorSkipBehavior.AUTO_SKIP }
-                    .keys
-                    .filter { it != SponsorCategory.POI_HIGHLIGHT }
-                    .map { it.apiKey }
-
-                val skipSegments = if (SponsorBlockPreferences.isEnabled.value && autoSkipCategories.isNotEmpty()) {
-                    updateProgress(video, quality.label, 0.88f, "Checking SponsorBlock...")
-                    fetchSponsorBlockSegmentsUs(
-                        videoId = video.videoId,
-                        categories = autoSkipCategories,
-                        cancellation = cancellation
-                    )
-                } else {
-                    emptyList()
-                }
+                updateProgress(video, quality.label, 0.88f, "Checking SponsorBlock...")
                 updateProgress(video, quality.label, 0.90f, "Muxing MP4...")
                 remuxTracksToMp4(rawVideoFile, rawAudioFile, tempMuxed, skipSegments, cancellation)
                 tempMuxed
@@ -820,11 +825,13 @@ class VideoDownloadManager(
 
         val skipSegments = if (SponsorBlockPreferences.isEnabled.value && autoSkipCategories.isNotEmpty()) {
             updateProgress(video, quality.label, 0.88f, "Checking SponsorBlock...")
-            fetchSponsorBlockSegmentsUs(
-                videoId = video.videoId,
-                categories = autoSkipCategories,
-                cancellation = cancellation
-            )
+            runCatching {
+                fetchSponsorBlockSegmentsUs(
+                    videoId = video.videoId,
+                    categories = autoSkipCategories,
+                    cancellation = cancellation
+                )
+            }.getOrDefault(emptyList())
         } else {
             emptyList()
         }
@@ -1050,7 +1057,7 @@ class VideoDownloadManager(
                 var downloaded = 0L
                 body.byteStream().use { input ->
                     FileOutputStream(destination).use { output ->
-                        val buffer = ByteArray(128 * 1024)
+                        val buffer = ByteArray(256 * 1024)
                         var read: Int
                         while (input.read(buffer).also { read = it } != -1) {
                             cancellation.ensureActive()
@@ -1067,7 +1074,11 @@ class VideoDownloadManager(
 
         // Parallel ranged chunks. Each coroutine writes to its own disjoint offset of the
         // same file via RandomAccessFile, so no merge pass is needed.
-        val chunkCount = 8
+        val chunkCount = when {
+            totalBytes >= 64L * 1024 * 1024 -> 12
+            totalBytes >= 16L * 1024 * 1024 -> 8
+            else -> 4
+        }.coerceAtLeast(2)
         val chunkSize = totalBytes / chunkCount
         val progress = ThrottledProgress(onReport = onProgress)
         val downloaded = AtomicLong(0L)
@@ -1080,34 +1091,53 @@ class VideoDownloadManager(
                 async(Dispatchers.IO) {
                     val start = index * chunkSize
                     val end = if (index == chunkCount - 1) totalBytes - 1 else start + chunkSize - 1
-
-                    okHttpClient.newCall(requestFor("bytes=$start-$end"))
-                        .executeCancellable(cancellation).use { response ->
-                            if (response.code != 206) {
-                                throw IllegalStateException("HTTP ${response.code} for range $start-$end")
-                            }
-                            val body = response.body
-                                ?: throw IllegalStateException("Empty response body for range $start-$end")
-
-                            RandomAccessFile(destination, "rw").use { file ->
-                                file.seek(start)
-                                body.byteStream().use { input ->
-                                    val buffer = ByteArray(128 * 1024)
-                                    var read: Int
-                                    var written = 0L
-                                    while (input.read(buffer).also { read = it } != -1) {
-                                        cancellation.ensureActive()
-                                        file.write(buffer, 0, read)
-                                        written += read.toLong()
-                                        val downloadedNow = downloaded.addAndGet(read.toLong())
-                                        progress.report(downloadedNow.toFloat() / totalBytes, downloadedNow)
+                    var attempt = 0
+                    var completed = false
+                    var lastError: Exception? = null
+                    while (attempt < 3 && !completed) {
+                        attempt++
+                        var attemptWritten = 0L
+                        try {
+                            cancellation.ensureActive()
+                            okHttpClient.newCall(requestFor("bytes=$start-$end"))
+                                .executeCancellable(cancellation).use { response ->
+                                    if (response.code != 206) {
+                                        throw IllegalStateException("HTTP ${response.code} for range $start-$end")
                                     }
-                                    if (written != end - start + 1L) {
-                                        throw IllegalStateException("Incomplete chunk $index: $written bytes")
+                                    val body = response.body
+                                        ?: throw IllegalStateException("Empty response body for range $start-$end")
+
+                                    RandomAccessFile(destination, "rw").use { file ->
+                                        file.seek(start)
+                                        body.byteStream().use { input ->
+                                            val buffer = ByteArray(256 * 1024)
+                                            var read: Int
+                                            while (input.read(buffer).also { read = it } != -1) {
+                                                cancellation.ensureActive()
+                                                file.write(buffer, 0, read)
+                                                attemptWritten += read.toLong()
+                                                val downloadedNow = downloaded.addAndGet(read.toLong())
+                                                progress.report(downloadedNow.toFloat() / totalBytes, downloadedNow)
+                                            }
+                                            val expectedLen = end - start + 1L
+                                            if (attemptWritten != expectedLen) {
+                                                throw IllegalStateException("Incomplete chunk $index: $attemptWritten/$expectedLen bytes")
+                                            }
+                                        }
                                     }
                                 }
+                            completed = true
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                            cancellation.ensureActive()
+                            lastError = e
+                            if (attemptWritten > 0L) {
+                                downloaded.addAndGet(-attemptWritten)
+                                progress.report(downloaded.get().toFloat() / totalBytes, downloaded.get())
                             }
                         }
+                    }
+                    if (!completed) throw (lastError ?: IllegalStateException("Chunk $index failed"))
                 }
             }.awaitAll()
         }
@@ -1199,16 +1229,36 @@ class VideoDownloadManager(
         FileOutputStream(outputFile).use { out ->
             segmentUrls.forEachIndexed { index, segUrl ->
                 cancellation.ensureActive()
-                val req = Request.Builder()
-                    .url(segUrl)
-                    .header("User-Agent", iosUserAgent)
-                    .get()
-                    .build()
+                var attempt = 0
+                var written = false
+                var lastError: Exception? = null
+                while (attempt < 3 && !written) {
+                    attempt++
+                    try {
+                        val req = Request.Builder()
+                            .url(segUrl)
+                            .header("User-Agent", iosUserAgent)
+                            .get()
+                            .build()
 
-                okHttpClient.newCall(req).executeCancellable(cancellation).use { resp ->
-                    if (resp.isSuccessful) {
-                        resp.body?.byteStream()?.use { it.copyTo(out) }
+                        okHttpClient.newCall(req).executeCancellable(cancellation).use { resp ->
+                            if (!resp.isSuccessful) {
+                                throw IllegalStateException("HTTP ${resp.code} fetching HLS segment ${index + 1}/${segmentUrls.size}")
+                            }
+                            val body = resp.body
+                                ?: throw IllegalStateException("Empty HLS segment ${index + 1}/${segmentUrls.size}")
+                            body.byteStream().use { input -> input.copyTo(out, 256 * 1024) }
+                        }
+                        written = true
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        cancellation.ensureActive()
+                        lastError = e
+                        if (attempt < 3) delay(250L * attempt)
                     }
+                }
+                if (!written) {
+                    throw lastError ?: IllegalStateException("Failed HLS segment ${index + 1}/${segmentUrls.size}")
                 }
                 onProgress((index + 1).toFloat() / segmentUrls.size.toFloat())
             }
@@ -1290,8 +1340,6 @@ class VideoDownloadManager(
 
             // Mux video samples with SponsorBlock segment trimming
             if (extractorVideo != null && videoTrackIndex >= 0) {
-                var outputPresentationTimeUs = 0L
-                var lastInputTimeUs = 0L
                 // Samples arrive in chronological order, so a single cursor replaces the
                 // old per-sample filter/sumOf scan over every skip segment.
                 val sortedSkips = skipSegments.sortedBy { it.startSec }
@@ -1311,7 +1359,6 @@ class VideoDownloadManager(
                     } else {
                         0
                     }
-                    lastInputTimeUs = info.presentationTimeUs
 
                     val currentSec = info.presentationTimeUs / 1_000_000f
                     while (skipCursor < sortedSkips.size && sortedSkips[skipCursor].endSec <= currentSec) {
@@ -1324,9 +1371,10 @@ class VideoDownloadManager(
                         continue
                     }
 
-                    // Adjust timestamps if segments were removed
-                    info.presentationTimeUs = (info.presentationTimeUs - cumulativeTrimUs).coerceAtLeast(outputPresentationTimeUs)
-                    outputPresentationTimeUs = info.presentationTimeUs
+                    // Adjust timestamps if segments were removed. Do not force monotonic PTS
+                    // on video: H.264 B-frames have out-of-order presentation times and clamping
+                    // them causes jitter.
+                    info.presentationTimeUs = (info.presentationTimeUs - cumulativeTrimUs).coerceAtLeast(0L)
 
                     muxer.writeSampleData(videoTrackIndex, buffer, info)
                     extractorVideo.advance()

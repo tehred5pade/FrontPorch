@@ -6,13 +6,16 @@ object SlopAndClickbaitFilter {
         "wait for the end", "wait till the end", "watch till the end",
         "watch until the end", "you won't believe", "gone wrong",
         "99% fail", "part 2", "part 3", "#fyp", "#viral", "#trending",
-        "sub for more",
+        "sub for more", "don't scroll", "do not scroll", "must watch",
+        "before it's too late", "shocking truth", "what happens next",
+        "nobody talks about", "this will blow your mind",
         // AI slop & TTS farm markers
         "#ai", "#aigenerated", "#aiart", "#aivideo", "#sora", "#soraai",
         "#kling", "#klingai", "#midjourney", "#runwayml", "#veo", "#veo2",
         "#luma", "#aihistory", "#aicat", "#aidog", "#aianimation",
         "made with ai", "created with ai", "ai generated", "ai cover",
-        "ai voice", "reddit stories", "minecraft parkour"
+        "ai voice", "ai voiceover", "text to speech", "text-to-speech",
+        "reddit stories", "reddit story", "minecraft parkour"
     )
 
     private val spamPunctuation = Regex("""[!?]{2,}""")

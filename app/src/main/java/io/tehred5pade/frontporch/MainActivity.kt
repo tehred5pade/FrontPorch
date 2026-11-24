@@ -443,6 +443,7 @@ class MainActivity : ComponentActivity() {
                 val isWatchRoute = currentRoute.startsWith("watch/")
                 val hasVisiblePlayer =
                     activeVideo != null && playbackMode != PlaybackMode.BACKGROUND_AUDIO
+                val hasOfflineFullscreenPlayer = isOfflineVideoPlaying && activeVideo == null
 
                 val isShortsSection = currentRoute == "tabs" &&
                     tabs.getOrNull(pagerState.currentPage) == AppTab.SHORTS
@@ -496,8 +497,12 @@ class MainActivity : ComponentActivity() {
                 val measuredTabBarDp = with(density) {
                     if (bottomBarHeightPx > 0) bottomBarHeightPx.toDp() else 80.dp + navBarBottom
                 }
-                val feedBottomClearance = measuredTabBarDp +
-                    if (hasVisiblePlayer && !isLandscape) 74.dp else 12.dp
+                val feedBottomClearance = if (isLandscape) {
+                    12.dp
+                } else {
+                    measuredTabBarDp + if (hasVisiblePlayer) 74.dp else 12.dp
+                }
+                val feedEndClearance = if (isLandscape) measuredTabBarDp else 0.dp
 
                 Box(
                     modifier = Modifier
@@ -522,7 +527,7 @@ class MainActivity : ComponentActivity() {
                                         // Keep every tab mounted so returning to Shorts restores the
                                         // exact Short and its already-buffered player.
                                         beyondViewportPageCount = tabs.size - 1,
-                                        userScrollEnabled = !hasVisiblePlayer || isPlayerMinimized,
+                                        userScrollEnabled = (!hasVisiblePlayer || isPlayerMinimized) && !hasOfflineFullscreenPlayer,
                                         modifier = Modifier.fillMaxSize()
                                     ) { pageIndex ->
                                         when (tabs[pageIndex]) {
@@ -745,6 +750,7 @@ class MainActivity : ComponentActivity() {
                                                 },
                                                 topContentPadding = settingsTopClearance,
                                                 bottomContentPadding = feedBottomClearance,
+                                                endContentPadding = feedEndClearance,
                                                 onBackOverlayChanged = { key, visible -> setBackOverlay(key, visible) }
                                             )
                                         }
@@ -921,13 +927,14 @@ class MainActivity : ComponentActivity() {
                 // 3. Frosted tab bar: NavigationRail on right in landscape, NavigationBar on bottom in portrait.
                 if (!isWatchRoute) {
                     if (isLandscape) {
-                        val tabBarAlpha = if (activeVideo == null) 1f else 0f
+                        val hideTabBar = activeVideo != null || hasOfflineFullscreenPlayer
+                        val tabBarAlpha = if (hideTabBar) 0f else 1f
                         Box(
                             modifier = Modifier
                                 .align(Alignment.CenterEnd)
                                 .fillMaxHeight()
                                 .width(measuredTabBarDp)
-                                .zIndex(if (activeVideo == null) 3f else -10f)
+                                .zIndex(if (hideTabBar) -10f else 3f)
                                 .graphicsLayer { alpha = tabBarAlpha }
                                 .hazeEffect(state = hazeState, style = sharedGlassStyle)
                                 .background(scheme.surfaceContainer.copy(alpha = 0.62f))
@@ -970,10 +977,10 @@ class MainActivity : ComponentActivity() {
                         }
                     } else {
                         // Fade in on the same curve the comments and scrim fade out.
-                        val tabBarAlpha = if (activeVideo == null) {
-                            1f
-                        } else {
-                            (playerCollapseProgress * 2.5f).coerceIn(0f, 1f)
+                        val tabBarAlpha = when {
+                            activeVideo != null -> (playerCollapseProgress * 2.5f).coerceIn(0f, 1f)
+                            hasOfflineFullscreenPlayer -> 0f
+                            else -> 1f
                         }
                         // The tab bar's top corners square off as the mini-player docks,
                         // so the two panels become one continuous glass bar.
@@ -989,7 +996,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
                                 .fillMaxWidth()
-                                .zIndex(if (activeVideo == null || playerCollapseProgress > 0.3f) 3f else -10f)
+                                .zIndex(if ((activeVideo == null && !hasOfflineFullscreenPlayer) || playerCollapseProgress > 0.3f) 3f else -10f)
                                 .graphicsLayer { alpha = tabBarAlpha }
                                 .onSizeChanged { size ->
                                     if (size.height > 0) bottomBarHeightPx = size.height
