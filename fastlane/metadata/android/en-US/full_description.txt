@@ -1,6 +1,1 @@
-Front Porch is a lightweight, privacy-focused YouTube client built with Jetpack Compose.
-
-Features:
-- Ad-free video playback with full SponsorBlock category controls
-- Offline video and audio downloads with background playback
-- Subscription imports from NewPipe (JSON) and Google Takeout (CSV)
+FrontPorch is an open-source Android application published via FOSS Deployer.
