@@ -27,6 +27,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:label="@string/app_name"
             android:theme="@style/Theme.FrontPorch"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale"
@@ -35,6 +36,54 @@
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- YouTube video links. Deliberately not autoVerify: FrontPorch cannot host
+                 assetlinks.json, so the system should continue showing a chooser. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" android:host="youtube.com" />
+                <data android:scheme="https" android:host="www.youtube.com" />
+                <data android:scheme="https" android:host="m.youtube.com" />
+                <data android:scheme="https" android:host="music.youtube.com" />
+                <data android:scheme="https" android:host="youtube-nocookie.com" />
+                <data android:scheme="https" android:host="www.youtube-nocookie.com" />
+                <data android:scheme="http" android:host="youtube.com" />
+                <data android:scheme="http" android:host="www.youtube.com" />
+                <data android:scheme="http" android:host="m.youtube.com" />
+                <data android:scheme="http" android:host="music.youtube.com" />
+                <data android:scheme="http" android:host="youtube-nocookie.com" />
+                <data android:scheme="http" android:host="www.youtube-nocookie.com" />
+
+                <data android:pathPrefix="/watch" />
+                <data android:pathPrefix="/shorts" />
+                <data android:pathPrefix="/reel" />
+                <data android:pathPrefix="/embed" />
+                <data android:pathPrefix="/live" />
+                <data android:pathPrefix="/v" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" android:host="youtu.be" />
+                <data android:scheme="http" android:host="youtu.be" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="frontporch" android:host="watch" />
             </intent-filter>
         </activity>
 

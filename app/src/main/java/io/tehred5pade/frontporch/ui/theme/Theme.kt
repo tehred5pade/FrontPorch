@@ -1,11 +1,14 @@
 package io.tehred5pade.frontporch.ui.theme
 
 import android.content.Context
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -17,11 +20,21 @@ enum class AppBackgroundTheme(
     val subtitle: String,
     val isDark: Boolean
 ) {
+    SYSTEM("System", "Follow your device's light or dark setting", false),
     LIGHT("Light", "Clean white background with deep text", false),
     SOFT_IVORY("Soft Ivory", "Warm off-white background with deep text", false),
     DARK("Dark", "Deep navy background with light text", true),
-    AMOLED("AMOLED", "Pure black background with light text", true)
+    AMOLED("AMOLED", "Pure black background with light text", true);
+
+    /** SYSTEM has no fixed palette; resolve it against the current device setting. */
+    fun resolved(systemIsDark: Boolean): AppBackgroundTheme = when (this) {
+        SYSTEM -> if (systemIsDark) DARK else LIGHT
+        else -> this
+    }
 }
+
+/** The actual palette in use after SYSTEM has been resolved. */
+val LocalEffectiveBackgroundTheme = compositionLocalOf { AppBackgroundTheme.SYSTEM }
 
 enum class AppHighlightColor(val label: String, val color: Color) {
     RED("Red", Color(0xFFE53935)),
@@ -109,6 +122,8 @@ private val AmoledPalette = BackgroundPalette(
 )
 
 private fun paletteFor(theme: AppBackgroundTheme): BackgroundPalette = when (theme) {
+    // Callers resolve SYSTEM before asking for a palette; this is only a safe fallback.
+    AppBackgroundTheme.SYSTEM -> LightPalette
     AppBackgroundTheme.LIGHT -> LightPalette
     AppBackgroundTheme.SOFT_IVORY -> SoftIvoryPalette
     AppBackgroundTheme.DARK -> DarkPalette
@@ -218,7 +233,8 @@ class ThemePreferences(context: Context) {
         val migrated = when (legacy) {
             "PORCH_LIGHT" -> AppBackgroundTheme.LIGHT
             "AMOLED_DARK" -> AppBackgroundTheme.AMOLED
-            "MIDNIGHT_BLUE", "SYSTEM" -> AppBackgroundTheme.DARK
+            "MIDNIGHT_BLUE" -> AppBackgroundTheme.DARK
+            "SYSTEM" -> AppBackgroundTheme.SYSTEM
             else -> DEFAULT_BACKGROUND
         }
         prefs.edit()
@@ -251,13 +267,19 @@ fun FrontPorchTheme(
     highlightColor: AppHighlightColor,
     content: @Composable () -> Unit
 ) {
-    val colorScheme = remember(backgroundTheme, highlightColor) {
-        colorSchemeFor(backgroundTheme, highlightColor)
+    val systemIsDark = isSystemInDarkTheme()
+    val effectiveTheme = remember(backgroundTheme, systemIsDark) {
+        backgroundTheme.resolved(systemIsDark)
+    }
+    val colorScheme = remember(effectiveTheme, highlightColor) {
+        colorSchemeFor(effectiveTheme, highlightColor)
     }
 
-    MaterialTheme(
-        colorScheme = colorScheme,
-        typography = Typography,
-        content = content
-    )
+    CompositionLocalProvider(LocalEffectiveBackgroundTheme provides effectiveTheme) {
+        MaterialTheme(
+            colorScheme = colorScheme,
+            typography = Typography,
+            content = content
+        )
+    }
 }

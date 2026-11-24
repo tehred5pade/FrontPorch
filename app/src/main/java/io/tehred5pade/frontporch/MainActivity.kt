@@ -1,6 +1,7 @@
 package io.tehred5pade.frontporch
 
 import android.app.Activity
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -103,8 +104,11 @@ import io.tehred5pade.frontporch.service.PlaybackSessionHolder
 import io.tehred5pade.frontporch.service.QueueVideoItem
 import io.tehred5pade.frontporch.ui.subscriptions.ChannelListScreen
 import io.tehred5pade.frontporch.ui.theme.FrontPorchTheme
+import io.tehred5pade.frontporch.ui.theme.LocalEffectiveBackgroundTheme
 import io.tehred5pade.frontporch.ui.theme.rememberMusicastGlassStyle
 import io.tehred5pade.frontporch.ui.theme.ThemePreferences
+import io.tehred5pade.frontporch.util.YouTubeLink
+import io.tehred5pade.frontporch.util.YouTubeLinkParser
 import io.tehred5pade.frontporch.update.AppUpdater
 import io.tehred5pade.frontporch.update.ReleaseInfo
 import io.tehred5pade.frontporch.update.UpdateCheckResult
@@ -115,6 +119,7 @@ data class ActiveVideoMeta(
     val videoId: String,
     val title: String,
     val channelName: String,
+    val startAtMs: Long = 0L,
     val localVideoPath: String? = null
 )
 
@@ -134,9 +139,24 @@ enum class AppTab(val label: String, val icon: ImageVector) {
 
 class MainActivity : ComponentActivity() {
     private lateinit var settingsRepository: UserSettingsRepository
+    private val pendingYouTubeLink = mutableStateOf<YouTubeLink?>(null)
+
+    private fun consumeYouTubeLink(intent: Intent?): YouTubeLink? {
+        val link = YouTubeLinkParser.parse(intent?.data?.toString())
+        // Clear the URI so a configuration change or activity restart does not replay it.
+        intent?.data = null
+        return link
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingYouTubeLink.value = consumeYouTubeLink(intent)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingYouTubeLink.value = consumeYouTubeLink(intent)
         SponsorBlockPreferences.init(applicationContext)
         val app = applicationContext as FrontPorchApp
         settingsRepository = UserSettingsRepository(applicationContext)
@@ -201,7 +221,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             // A newly opened video always starts expanded.
-            LaunchedEffect(activeVideo?.videoId) {
+            LaunchedEffect(activeVideo?.videoId, activeVideo?.startAtMs) {
                 if (activeVideo != null) {
                     isPlayerMinimized = false
                     playerCollapseProgress = 0f
@@ -333,15 +353,34 @@ class MainActivity : ComponentActivity() {
             fun openQueueVideo(
                 item: QueueVideoItem,
                 contextList: List<QueueVideoItem> = emptyList(),
-                mode: PlaybackMode = PlaybackMode.NORMAL
+                mode: PlaybackMode = PlaybackMode.NORMAL,
+                startAtMs: Long = 0L
             ) {
                 if (activeVideo != null) PlaybackSessionHolder.stopAndReleaseAll()
                 queueController.openVideo(item, contextList)
-                activeVideo = ActiveVideoMeta(item.videoId, item.title, item.channelName)
+                activeVideo = ActiveVideoMeta(
+                    videoId = item.videoId,
+                    title = item.title,
+                    channelName = item.channelName,
+                    startAtMs = startAtMs
+                )
                 playbackMode = mode
                 isPlayerMinimized = false
                 playerCollapseProgress = 0f
                 isOfflineVideoPlaying = false
+            }
+
+            // External YouTube links open the same player used by in-app items, with any
+            // ?t= / ?start= value carried through so playback begins at the shared moment.
+            val incomingYouTubeLink by pendingYouTubeLink
+            LaunchedEffect(incomingYouTubeLink) {
+                val link = incomingYouTubeLink ?: return@LaunchedEffect
+                pendingYouTubeLink.value = null
+                if (!YouTubeLinkParser.isValidVideoId(link.videoId)) return@LaunchedEffect
+                openQueueVideo(
+                    item = QueueVideoItem(link.videoId, "Video", ""),
+                    startAtMs = link.startMs
+                )
             }
 
             fun switchQueueVideo(item: QueueVideoItem) {
@@ -430,7 +469,7 @@ class MainActivity : ComponentActivity() {
                 val scheme = MaterialTheme.colorScheme
                 val sharedGlassStyle = rememberMusicastGlassStyle()
 
-                val isLightTheme = !backgroundTheme.isDark
+                val isLightTheme = !LocalEffectiveBackgroundTheme.current.isDark
                 SideEffect {
                     val window = (ctx as? android.app.Activity)?.window ?: return@SideEffect
                     val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
@@ -847,10 +886,28 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
 
-                                composable("watch/{videoId}") { backStackEntry ->
-                                    val videoId = backStackEntry.arguments?.getString("videoId") ?: ""
-                                    LaunchedEffect(videoId) {
-                                        openQueueVideo(QueueVideoItem(videoId, "Video", ""))
+                                composable(
+                                    route = "watch/{videoId}?startMs={startMs}",
+                                    arguments = listOf(
+                                        navArgument("videoId") { type = NavType.StringType },
+                                        navArgument("startMs") {
+                                            type = NavType.StringType
+                                            defaultValue = "0"
+                                        }
+                                    )
+                                ) { backStackEntry ->
+                                    val videoId = backStackEntry.arguments?.getString("videoId").orEmpty()
+                                    val startMs = backStackEntry.arguments?.getString("startMs")
+                                        ?.toLongOrNull()
+                                        ?.coerceAtLeast(0L)
+                                        ?: 0L
+                                    LaunchedEffect(videoId, startMs) {
+                                        if (YouTubeLinkParser.isValidVideoId(videoId)) {
+                                            openQueueVideo(
+                                                item = QueueVideoItem(videoId, "Video", ""),
+                                                startAtMs = startMs
+                                            )
+                                        }
                                         navController.popBackStack()
                                     }
                                 }
@@ -1065,6 +1122,7 @@ class MainActivity : ComponentActivity() {
                                 videoId = video.videoId,
                                 title = video.title,
                                 channelName = video.channelName,
+                                startAtMs = video.startAtMs,
                                 localVideoPath = video.localVideoPath,
                                 fallbackTitle = video.title,
                                 fallbackChannel = video.channelName,
@@ -1109,6 +1167,7 @@ class MainActivity : ComponentActivity() {
                                 videoId = video.videoId,
                                 title = video.title,
                                 channelName = video.channelName,
+                                startAtMs = video.startAtMs,
                                 localVideoPath = video.localVideoPath,
                                 okHttpClient = app.okHttpClient,
                                 visitorData = shortsViewModel.visitorData,
@@ -1148,6 +1207,7 @@ class MainActivity : ComponentActivity() {
                                     visitorData = shortsViewModel.visitorData,
                                     watchProgressRepository = watchProgressRepository,
                                     preferredAudioLanguage = userSettings.preferredAudioLanguage,
+                                    startAtMs = video.startAtMs,
                                     localVideoPath = video.localVideoPath,
                                     fallbackTitle = video.title,
                                     fallbackChannel = video.channelName,

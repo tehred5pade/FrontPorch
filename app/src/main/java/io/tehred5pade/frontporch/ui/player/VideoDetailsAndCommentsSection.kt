@@ -8,7 +8,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.tehred5pade.frontporch.data.video.VideoDetailsAndComments
@@ -33,6 +32,7 @@ fun VideoDetailsAndCommentsSection(
     }
     var isLoadingComments by remember(videoId) { mutableStateOf(true) }
     var descriptionExpanded by remember(videoId) { mutableStateOf(false) }
+    val scheme = MaterialTheme.colorScheme
 
     LaunchedEffect(videoId) {
         isLoadingComments = true
@@ -51,12 +51,12 @@ fun VideoDetailsAndCommentsSection(
                 Text(
                     text = details.title,
                     style = MaterialTheme.typography.titleMedium,
-                    color = Color.White
+                    color = scheme.onSurface
                 )
                 Text(
                     text = details.channelName,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFFB0B8C8)
+                    color = scheme.onSurfaceVariant
                 )
             }
         }
@@ -65,7 +65,7 @@ fun VideoDetailsAndCommentsSection(
         if (details.description.isNotBlank()) {
             item(key = "description") {
                 Surface(
-                    color = Color(0xFF1E222D),
+                    color = scheme.surfaceVariant,
                     shape = RoundedCornerShape(10.dp),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -75,13 +75,13 @@ fun VideoDetailsAndCommentsSection(
                         Text(
                             text = if (descriptionExpanded) "Description (tap to collapse)" else "Description",
                             style = MaterialTheme.typography.labelMedium,
-                            color = Color.White
+                            color = scheme.onSurfaceVariant
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = details.description,
                             style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFFD6DCE8),
+                            color = scheme.onSurface,
                             maxLines = if (descriptionExpanded) Int.MAX_VALUE else 3,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -92,12 +92,12 @@ fun VideoDetailsAndCommentsSection(
 
         // Comments Header
         item(key = "comments_header") {
-            HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+            HorizontalDivider(color = scheme.outlineVariant)
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = if (isLoadingComments) "Comments..." else "Comments (${details.comments.size})",
                 style = MaterialTheme.typography.titleSmall,
-                color = Color.White
+                color = scheme.onSurface
             )
         }
 
@@ -110,12 +110,12 @@ fun VideoDetailsAndCommentsSection(
                 Text(
                     text = comment.author,
                     style = MaterialTheme.typography.labelMedium,
-                    color = Color(0xFFB0B8C8)
+                    color = scheme.onSurfaceVariant
                 )
                 Text(
                     text = comment.text,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color.White
+                    color = scheme.onSurface
                 )
                 val metaLine = listOfNotNull(
                     comment.likeCount.takeIf { it.isNotBlank() }?.let { "$it likes" },
@@ -125,7 +125,7 @@ fun VideoDetailsAndCommentsSection(
                     Text(
                         text = metaLine,
                         style = MaterialTheme.typography.labelSmall,
-                        color = Color(0xFF8B94A7)
+                        color = scheme.onSurfaceVariant
                     )
                 }
             }

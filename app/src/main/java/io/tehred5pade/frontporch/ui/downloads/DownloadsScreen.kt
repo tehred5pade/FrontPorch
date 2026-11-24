@@ -336,6 +336,7 @@ fun DownloadsScreen(
                         Text(
                             text = active.title,
                             style = MaterialTheme.typography.titleSmall,
+                            color = scheme.onSurface,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -785,6 +786,7 @@ private fun DownloadedVideoRow(
                     Text(
                         text = item.title,
                         style = MaterialTheme.typography.titleSmall,
+                        color = scheme.onSurface,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -1144,7 +1146,9 @@ fun OfflineVideoPlayer(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.TopCenter)
-                    .background(Color.Black.copy(alpha = if (showControls) 0f else 0.35f))
+                    // Keep a scrim behind the title even while controls are visible so the
+                    // white text stays readable over bright video frames in every theme.
+                    .background(Color.Black.copy(alpha = 0.35f))
                     .statusBarsPadding()
                     .padding(16.dp)
             ) {

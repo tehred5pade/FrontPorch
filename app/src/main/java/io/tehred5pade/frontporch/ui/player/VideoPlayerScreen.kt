@@ -2,6 +2,8 @@ package io.tehred5pade.frontporch.ui.player
 
 import android.content.res.Configuration
 import android.net.Uri
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import io.tehred5pade.frontporch.R
@@ -83,6 +85,7 @@ fun VideoPlayerScreen(
     visitorData: String?,
     watchProgressRepository: WatchProgressRepository,
     preferredAudioLanguage: String = "en",
+    startAtMs: Long = 0L,
     localVideoPath: String? = null,
     fallbackTitle: String? = null,
     fallbackChannel: String? = null,
@@ -321,7 +324,15 @@ fun VideoPlayerScreen(
         }
 
         val saved = watchProgressRepository.positionFor(videoId)
-        val startAt = if (saved != null && saved > 3000L) saved else 0L
+        // An explicit link timestamp wins over saved resume, no matter how early it is.
+        val explicitStartMs = startAtMs.coerceAtLeast(0L)
+        val startAt = if (explicitStartMs > 0L) {
+            explicitStartMs
+        } else if (saved != null && saved > 3000L) {
+            saved
+        } else {
+            0L
+        }
 
         snapshot.posMs = startAt
         snapshot.canSave = (startAt == 0L)
@@ -375,7 +386,9 @@ fun VideoPlayerScreen(
                 )
 
                 if (!snapshot.canSave && exoPlayer.playbackState == Player.STATE_READY) {
-                    if (pendingResumeMs > 3000L) {
+                    val shouldSeek = pendingResumeMs > 0L &&
+                        (startAtMs > 0L || pendingResumeMs > 3000L)
+                    if (shouldSeek) {
                         exoPlayer.seekTo(pendingResumeMs)
                     }
                     snapshot.canSave = true
@@ -409,6 +422,27 @@ fun VideoPlayerScreen(
             """.trimIndent(),
             null
         )
+    }
+
+    // A second link to the same video can arrive while it is already open. Apply the new
+    // timestamp without remounting the player (initial startup is handled by pendingResumeMs).
+    var lastAppliedStartMs by remember(videoId) { mutableLongStateOf(startAtMs.coerceAtLeast(0L)) }
+    LaunchedEffect(videoId, startAtMs) {
+        val target = startAtMs.coerceAtLeast(0L)
+        if (target != lastAppliedStartMs) {
+            // Keep the pending resume value in sync so a WebView created later uses the
+            // new link's timestamp rather than the one from the previous open.
+            pendingResumeMs = target
+            if (target > 0L) {
+                jumpToSeconds(target / 1000f)
+                snapshot.canSave = true
+            } else {
+                watchedPositionMs = 0L
+                currentSeconds = 0L
+                snapshot.posMs = 0L
+            }
+        }
+        lastAppliedStartMs = target
     }
 
     fun seekRelativeSeconds(deltaSec: Long) {
@@ -486,7 +520,19 @@ fun VideoPlayerScreen(
                             }
                         }
 
-                        var adShowing = !!(mp && (mp.classList.contains('ad-showing') || mp.classList.contains('ad-interrupting')));
+                        var adShowing = !!(mp && (
+                            mp.classList.contains('ad-showing') ||
+                            mp.classList.contains('ad-interrupting') ||
+                            (typeof mp.getAdState === 'function' && mp.getAdState() > 0)
+                        ));
+                        var adOverlays = document.querySelectorAll('.ytp-ad-player-overlay, .ytp-ad-image-overlay, .ytp-ad-text-overlay, .ytp-ad-action-interstitial');
+                        for (var a = 0; a < adOverlays.length; a++) {
+                            var acs = window.getComputedStyle(adOverlays[a]);
+                            if (acs.display !== 'none' && acs.visibility !== 'hidden' && adOverlays[a].getClientRects().length > 0) {
+                                adShowing = true;
+                                break;
+                            }
+                        }
                         var skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button-slot button, .ytp-ad-skip-button-container button');
                         var skipActionable = false;
                         if (skipBtn && !skipBtn.disabled && skipBtn.getAttribute('aria-disabled') !== 'true') {
@@ -587,7 +633,9 @@ fun VideoPlayerScreen(
         while (true) {
             delay(500)
             val wv = webViewRef ?: continue
-            val pendingSeekSec = if (!snapshot.canSave && pendingResumeMs > 3000L) pendingResumeMs / 1000L else -1L
+            val shouldSeek = !snapshot.canSave && pendingResumeMs > 0L &&
+                (startAtMs > 0L || pendingResumeMs > 3000L)
+            val pendingSeekSec = if (shouldSeek) pendingResumeMs / 1000L else -1L
 
             wv.evaluateJavascript(
                 """
@@ -857,6 +905,17 @@ fun VideoPlayerScreen(
                                     }
                                 }
                                 webViewClient = object : android.webkit.WebViewClient() {
+                                    override fun shouldInterceptRequest(
+                                        view: android.webkit.WebView?,
+                                        request: WebResourceRequest?
+                                    ): WebResourceResponse? {
+                                        val url = request?.url?.toString().orEmpty()
+                                        if (isAdRequestUrl(url)) {
+                                            return WebResourceResponse("text/plain", "utf-8", null)
+                                        }
+                                        return super.shouldInterceptRequest(view, request)
+                                    }
+
                                     override fun onPageStarted(
                                         view: android.webkit.WebView?,
                                         url: String?,
@@ -1147,7 +1206,8 @@ fun VideoPlayerScreen(
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
                                 text = "Comments (${comments.size})",
-                                style = MaterialTheme.typography.titleSmall
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSurface
                             )
                         }
 
@@ -1155,12 +1215,14 @@ fun VideoPlayerScreen(
                             Column(modifier = Modifier.fillMaxWidth()) {
                                 Text(
                                     text = comment.author,
-                                    style = MaterialTheme.typography.labelMedium
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
                                     text = comment.text,
-                                    style = MaterialTheme.typography.bodyMedium
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
                                 )
                                 if (comment.likeCount.isNotEmpty() || comment.publishedTime.isNotEmpty()) {
                                     Spacer(modifier = Modifier.height(2.dp))
@@ -1479,6 +1541,22 @@ private fun formatDuration(totalSeconds: Long): String {
     return formatDurationSeconds(totalSeconds.toInt())
 }
 
+/** Ad/tracking hosts and URL markers that never serve the actual video content. */
+private fun isAdRequestUrl(url: String): Boolean {
+    if (url.isBlank()) return false
+    val lower = url.lowercase(Locale.ROOT)
+    val blockedHosts = listOf(
+        "doubleclick.net", "googleadservices.com", "googlesyndication.com",
+        "google-analytics.com", "googletagmanager.com", "adsense.com",
+        "adservice.google.com", "googleadservices", "ad.youtube.com"
+    )
+    if (blockedHosts.any { lower.contains(it) }) return true
+    val blockedPaths = listOf(
+        "/pagead/", "/ads/", "/ad_", "/getvideoinfo", "/airwrap", "/instreamad"
+    )
+    return blockedPaths.any { lower.contains(it) }
+}
+
 private fun injectCleanPlayerJs(webView: android.webkit.WebView?) {
     webView?.evaluateJavascript(
         """
@@ -1536,6 +1614,15 @@ private fun injectCleanPlayerJs(webView: android.webkit.WebView?) {
                     .ytp-ad-message-container,
                     .ytp-ad-preview-container,
                     .ytp-ad-progress-list,
+                    .ytp-ad-module,
+                    .ytp-ad-overlay-close-button,
+                    .ytp-ad-click-overlay,
+                    .ytp-ad-player-overlay-inflow,
+                    .ytp-ad-player-overlay-layout,
+                    .ytp-ad-player-overlay-skip-or-preview,
+                    .ytp-ad-player-overlay-footer,
+                    .ytp-ad-player-overlay-details,
+                    .ytp-ad-info-dialog,
                     ytm-ad-badge-renderer,
                     ytm-autonav-overlay-renderer,
                     .ytm-autonav-bar,
@@ -1609,15 +1696,32 @@ private fun injectCleanPlayerJs(webView: android.webkit.WebView?) {
             }
 
             // Post-roll ads do not always set YouTube's ad-showing class. Kill any
-            // short secondary video and click visible skip controls on a fast timer,
+            // secondary ad video and click visible skip controls on a fast timer,
             // independent of the Compose watcher below.
             if (!window.__fpAdKillerInstalled) {
                 window.__fpAdKillerInstalled = true;
+                window.__fpAdKillCount = 0;
                 window.__fpSkipAd = function() {
                     var player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
                     var allVideos = Array.prototype.slice.call(document.querySelectorAll('video'));
                     var mainVideo = document.querySelector('video.html5-main-video') || allVideos[0];
-                    var adShowing = !!(player && (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')));
+                    var adShowing = !!(player && (
+                        player.classList.contains('ad-showing') ||
+                        player.classList.contains('ad-interrupting') ||
+                        player.classList.contains('ytp-ad-player-overlay') ||
+                        (typeof player.getAdState === 'function' && player.getAdState() > 0)
+                    ));
+                    var adContainers = document.querySelectorAll(
+                        '.ytp-ad-player-overlay, .ytp-ad-image-overlay, .ytp-ad-text-overlay, .ytp-ad-action-interstitial'
+                    );
+                    var adOverlayVisible = false;
+                    for (var o = 0; o < adContainers.length; o++) {
+                        var cs = window.getComputedStyle(adContainers[o]);
+                        if (cs.display !== 'none' && cs.visibility !== 'hidden' && adContainers[o].getClientRects().length > 0) {
+                            adOverlayVisible = true;
+                            break;
+                        }
+                    }
                     var skipSelectors = [
                         '.ytp-ad-skip-button',
                         '.ytp-skip-ad-button',
@@ -1631,35 +1735,54 @@ private fun injectCleanPlayerJs(webView: android.webkit.WebView?) {
                     ];
                     var skipBtn = null;
                     for (var s = 0; s < skipSelectors.length; s++) {
-                        var candidate = document.querySelector(skipSelectors[s]);
-                        if (!candidate || candidate.disabled || candidate.getAttribute('aria-disabled') === 'true') continue;
-                        var cs = window.getComputedStyle(candidate);
-                        if (cs.display === 'none' || cs.visibility === 'hidden' || candidate.getClientRects().length === 0) continue;
-                        skipBtn = candidate;
-                        break;
+                        var candidates = document.querySelectorAll(skipSelectors[s]);
+                        for (var c = 0; c < candidates.length; c++) {
+                            var candidate = candidates[c];
+                            if (candidate.disabled || candidate.getAttribute('aria-disabled') === 'true') continue;
+                            var s2 = window.getComputedStyle(candidate);
+                            if (s2.display === 'none' || s2.visibility === 'hidden' || candidate.getClientRects().length === 0) continue;
+                            skipBtn = candidate;
+                            break;
+                        }
+                        if (skipBtn) break;
                     }
                     if (skipBtn) {
-                        try { skipBtn.click(); } catch (e) {}
+                        try { skipBtn.click(); window.__fpAdKillCount++; } catch (e) {}
                     }
 
+                    // Kill any short secondary video: preroll, midroll pods, and postroll all
+                    // create a separate element while the main video keeps its timeline.
                     var killedAdVideo = false;
                     for (var i = 0; i < allVideos.length; i++) {
                         var adVideo = allVideos[i];
                         if (adVideo === mainVideo) continue;
                         if (!isFinite(adVideo.duration) || adVideo.duration <= 0 || adVideo.duration > 180) continue;
-                        if (adVideo.paused || adVideo.ended) continue;
+                        if (adVideo.ended) continue;
                         try {
                             adVideo.muted = true;
                             adVideo.playbackRate = 16.0;
                             adVideo.currentTime = adVideo.duration;
-                            killedAdVideo = true;
+                            if (!adVideo.paused) killedAdVideo = true;
                         } catch (e) {}
                     }
 
-                    if (adShowing && player && typeof player.skip === 'function') {
-                        try { player.skip(); killedAdVideo = true; } catch (e) {}
+                    if ((adShowing || adOverlayVisible) && player && typeof player.skip === 'function') {
+                        try { player.skip(); killedAdVideo = true; window.__fpAdKillCount++; } catch (e) {}
                     }
-                    return killedAdVideo || !!skipBtn;
+                    // Last resort for postroll pods where no skip button appears. Only
+                    // touch the fallback "first video" element when there is no distinct
+                    // html5-main-video (otherwise that is real content and must never be seeked).
+                    var hasDistinctMainVideo = !!document.querySelector('video.html5-main-video');
+                    if (!hasDistinctMainVideo && adShowing && !killedAdVideo && mainVideo && !mainVideo.ended && isFinite(mainVideo.duration) && mainVideo.duration > 0 && mainVideo.duration <= 180) {
+                        try {
+                            mainVideo.muted = true;
+                            mainVideo.playbackRate = 16.0;
+                            mainVideo.currentTime = mainVideo.duration;
+                            killedAdVideo = true;
+                            window.__fpAdKillCount++;
+                        } catch (e) {}
+                    }
+                    return killedAdVideo || !!skipBtn || adShowing || adOverlayVisible;
                 };
                 setInterval(window.__fpSkipAd, 120);
                 document.addEventListener('ended', function(e) {
@@ -1668,6 +1791,13 @@ private fun injectCleanPlayerJs(webView: android.webkit.WebView?) {
                     try { e.target.pause(); } catch (err) {}
                     window.__fpSkipAd();
                 }, true);
+                // Also catch newly inserted ad video elements immediately.
+                try {
+                    new MutationObserver(function() { window.__fpSkipAd(); }).observe(
+                        document.documentElement || document.body,
+                        { childList: true, subtree: true }
+                    );
+                } catch (e) {}
             }
         })();
         """.trimIndent(),
