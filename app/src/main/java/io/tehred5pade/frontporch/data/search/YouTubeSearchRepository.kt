@@ -38,7 +38,9 @@ sealed class YouTubeSearchResult {
         override val id: String,
         val title: String,
         val viewsText: String,
-        val thumbnailUrl: String
+        val thumbnailUrl: String,
+        val channelTitle: String = "",
+        val channelId: String = ""
     ) : YouTubeSearchResult()
 
     data class Channel(
@@ -363,7 +365,9 @@ class YouTubeSearchRepository(private val okHttpClient: OkHttpClient) {
                 id = videoId,
                 title = title,
                 viewsText = views,
-                thumbnailUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+                thumbnailUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg",
+                channelTitle = channelName,
+                channelId = channelId
             )
         } else if (title.isNotBlank()) {
             YouTubeSearchResult.Video(
@@ -422,11 +426,19 @@ class YouTubeSearchRepository(private val okHttpClient: OkHttpClient) {
         val rir = entry.optJSONObject("reelItemRenderer") ?: return null
         val videoId = rir.optString("videoId")
         if (videoId.isBlank()) return null
+        val ownerRuns = rir.optJSONObject("ownerText")?.optJSONArray("runs")
+        val channelTitle = ownerRuns?.optJSONObject(0)?.optString("text").orEmpty()
+        val channelId = ownerRuns?.optJSONObject(0)
+            ?.optJSONObject("navigationEndpoint")
+            ?.optJSONObject("browseEndpoint")
+            ?.optString("browseId").orEmpty()
         return YouTubeSearchResult.Short(
             id = videoId,
             title = readText(rir.optJSONObject("headline")),
             viewsText = readText(rir.optJSONObject("viewCountText")),
-            thumbnailUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+            thumbnailUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg",
+            channelTitle = channelTitle,
+            channelId = channelId
         )
     }
 

@@ -3,17 +3,19 @@ package io.tehred5pade.frontporch.ui.shorts
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.tehred5pade.frontporch.FrontPorchApp
 import io.tehred5pade.frontporch.data.db.SubscriptionDao
 import io.tehred5pade.frontporch.data.db.SubscriptionEntity
 import io.tehred5pade.frontporch.data.innertube.InnerTubeShortsService
+import io.tehred5pade.frontporch.data.local.FrontPorchDatabase
 import io.tehred5pade.frontporch.data.model.ShortsCategoryItem
 import io.tehred5pade.frontporch.data.prefs.ShortRepeatCooldown
 import io.tehred5pade.frontporch.data.prefs.UserSettings
 import io.tehred5pade.frontporch.data.prefs.UserSettingsRepository
+import io.tehred5pade.frontporch.data.recommendation.ShortsRecommendationEngine
 import io.tehred5pade.frontporch.data.search.SearchFilter
 import io.tehred5pade.frontporch.data.search.YouTubeSearchRepository
 import io.tehred5pade.frontporch.data.search.YouTubeSearchResult
-import io.tehred5pade.frontporch.FrontPorchApp
 import io.tehred5pade.frontporch.data.util.SlopAndClickbaitFilter
 import io.tehred5pade.frontporch.fetchVisitorData
 import io.tehred5pade.frontporch.ui.models.ShortItem
@@ -22,7 +24,15 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 
@@ -71,6 +81,21 @@ class ShortsViewModel(
         return true
     }
 
+    /** Direct search requests still honor explicit dislikes and blocked channels. */
+    fun canOpenRequestedShort(videoId: String, channelId: String): Boolean {
+        if (videoId.isBlank()) return false
+        val settings = userSettings.value
+        if (videoId in blockedShortIds || videoId in settings.dislikedShortIds) return false
+        return channelId.isBlank() || channelId !in settings.blockedShortChannelIds
+    }
+
+    /** Prepend a user-selected Short so it plays immediately instead of waiting for discovery. */
+    fun openRequestedShort(short: ShortItem) {
+        _shorts.update { current ->
+            (listOf(short) + current.filterNot { it.id == short.id }).distinctBy { it.id }
+        }
+    }
+
     // Shorts that failed to resolve or render this session. Filtering them out of every
     // batch means an auto-skipped black screen never comes back on a later refresh.
     private val blockedShortIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -100,9 +125,20 @@ class ShortsViewModel(
         return !SlopAndClickbaitFilter.isSlopOrClickbait(item.title, item.channelTitle)
     }
 
+    private val recommendationEngine = ShortsRecommendationEngine(
+        FrontPorchDatabase.getDatabase(application).recommendationDao(),
+        subscriptionDao,
+        shortsService,
+        searchRepository
+    )
+
     init {
         // Drop any placeholder-creator Shorts already present from an earlier session.
         _shorts.update { list -> list.filterNot { isBlockedCreator(it) } }
+
+        viewModelScope.launch {
+            recommendationEngine.seedSubscriptions()
+        }
 
         viewModelScope.launch {
             combine(
@@ -126,23 +162,38 @@ class ShortsViewModel(
 
     fun likeShort(short: ShortItem) {
         viewModelScope.launch {
-            if (short.id in userSettings.value.likedShortIds) {
-                settingsRepository.clearShortFeedback(short.id)
-            } else {
+            val isLiked = short.id !in userSettings.value.likedShortIds
+            if (isLiked) {
                 settingsRepository.setShortFeedback(short.id, short.channelId, liked = true)
+            } else {
+                settingsRepository.clearShortFeedback(short.id)
             }
-            // No pager reorder here: liked IDs seed the next batch in fetchCombinedShortsBatch.
+            recommendationEngine.recordFeedback(
+                videoId = short.id,
+                channelId = short.channelId,
+                channelName = short.channelTitle,
+                title = short.title,
+                isLiked = isLiked
+            )
         }
     }
 
     fun dislikeShort(short: ShortItem) {
         viewModelScope.launch {
             val settings = userSettings.value
-            if (short.id in settings.dislikedShortIds) {
+            val isDisliked = short.id !in settings.dislikedShortIds
+            if (isDisliked) {
+                settingsRepository.setShortFeedback(short.id, short.channelId, liked = false)
+            } else {
                 settingsRepository.clearShortFeedback(short.id)
-                return@launch
             }
-            settingsRepository.setShortFeedback(short.id, short.channelId, liked = false)
+            recommendationEngine.recordFeedback(
+                videoId = short.id,
+                channelId = short.channelId,
+                channelName = short.channelTitle,
+                title = short.title,
+                isLiked = false
+            )
 
             val newCount = (settings.dislikedShortChannelCounts[short.channelId] ?: 0) + 1
             val channelNowBlocked = short.channelId.isNotBlank() && newCount >= 2
@@ -153,6 +204,8 @@ class ShortsViewModel(
                     list.filterNot { it.id == short.id }
                 }
             }
+            val ranked = recommendationEngine.rankCandidates(_shorts.value)
+            _shorts.value = ranked
         }
     }
 
@@ -243,11 +296,10 @@ class ShortsViewModel(
             }.awaitAll().flatten()
         }
 
-        filterRepeats(candidates, settings.seenShortsTimestamps, settings.repeatCooldown)
+        val filtered = filterRepeats(candidates, settings.seenShortsTimestamps, settings.repeatCooldown)
             .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
-            .shuffled()
-            .take(8)
+        recommendationEngine.rankCandidates(filtered).take(8)
     }
 
     fun loadMoreShorts() {
@@ -380,6 +432,7 @@ class ShortsViewModel(
                 runCatching {
                     shortsService.fetchReelSequence(
                         seedVideoId = likedId,
+                        continuation = null,
                         visitorData = visitorData,
                         preferredAudioLanguage = settings.preferredAudioLanguage
                     ).first
@@ -469,7 +522,7 @@ class ShortsViewModel(
             }
         }
 
-        blended
+        recommendationEngine.rankCandidates(blended)
             .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
             .take(20)

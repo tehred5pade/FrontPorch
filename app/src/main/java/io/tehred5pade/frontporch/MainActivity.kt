@@ -27,34 +27,52 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalDensity
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeEffect
-import dev.chrisbanes.haze.hazeSource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Subscriptions
-import androidx.compose.material3.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
-import androidx.compose.runtime.*
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.zIndex
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -64,6 +82,9 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.hazeSource
 import io.tehred5pade.frontporch.data.db.SubscriptionEntity
 import io.tehred5pade.frontporch.data.download.DownloadSettingsStore
 import io.tehred5pade.frontporch.data.importexport.NewPipeSubscriptionImporter
@@ -77,6 +98,11 @@ import io.tehred5pade.frontporch.data.playlist.PlaylistStore
 import io.tehred5pade.frontporch.data.prefs.UserSettings
 import io.tehred5pade.frontporch.data.prefs.UserSettingsRepository
 import io.tehred5pade.frontporch.data.search.YouTubeSearchRepository
+import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
+import io.tehred5pade.frontporch.data.video.VideoMetadataRepository
+import io.tehred5pade.frontporch.service.PlaybackQueueController
+import io.tehred5pade.frontporch.service.PlaybackSessionHolder
+import io.tehred5pade.frontporch.service.QueueVideoItem
 import io.tehred5pade.frontporch.ui.common.frostedGlass
 import io.tehred5pade.frontporch.ui.downloads.DownloadQuality
 import io.tehred5pade.frontporch.ui.downloads.DownloadsScreen
@@ -88,30 +114,26 @@ import io.tehred5pade.frontporch.ui.feed.FeedVideoMenuState
 import io.tehred5pade.frontporch.ui.feed.FeedViewModel
 import io.tehred5pade.frontporch.ui.player.DraggableVideoPlayerOverlay
 import io.tehred5pade.frontporch.ui.player.FloatingVideoWindow
+import io.tehred5pade.frontporch.ui.player.KeepScreenOnEffect
 import io.tehred5pade.frontporch.ui.player.VideoDetailsAndCommentsSection
 import io.tehred5pade.frontporch.ui.player.VideoPlayerScreen
-import io.tehred5pade.frontporch.ui.player.KeepScreenOnEffect
 import io.tehred5pade.frontporch.ui.search.SearchScreen
-import io.tehred5pade.frontporch.data.video.VideoMetadataRepository
 import io.tehred5pade.frontporch.ui.settings.SettingsScreen
+import io.tehred5pade.frontporch.ui.shorts.ShortLaunchRequest
 import io.tehred5pade.frontporch.ui.shorts.ShortsScreen
 import io.tehred5pade.frontporch.ui.shorts.ShortsViewModel
 import io.tehred5pade.frontporch.ui.subscriptions.ChannelDetailScreen
 import io.tehred5pade.frontporch.ui.subscriptions.ChannelDetailViewModel
-import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
-import io.tehred5pade.frontporch.service.PlaybackQueueController
-import io.tehred5pade.frontporch.service.PlaybackSessionHolder
-import io.tehred5pade.frontporch.service.QueueVideoItem
 import io.tehred5pade.frontporch.ui.subscriptions.ChannelListScreen
 import io.tehred5pade.frontporch.ui.theme.FrontPorchTheme
 import io.tehred5pade.frontporch.ui.theme.LocalEffectiveBackgroundTheme
-import io.tehred5pade.frontporch.ui.theme.rememberMusicastGlassStyle
 import io.tehred5pade.frontporch.ui.theme.ThemePreferences
-import io.tehred5pade.frontporch.util.YouTubeLink
-import io.tehred5pade.frontporch.util.YouTubeLinkParser
+import io.tehred5pade.frontporch.ui.theme.rememberMusicastGlassStyle
 import io.tehred5pade.frontporch.update.AppUpdater
 import io.tehred5pade.frontporch.update.ReleaseInfo
 import io.tehred5pade.frontporch.update.UpdateCheckResult
+import io.tehred5pade.frontporch.util.YouTubeLink
+import io.tehred5pade.frontporch.util.YouTubeLinkParser
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -258,6 +280,10 @@ class MainActivity : ComponentActivity() {
 
             val searchRepo = remember { YouTubeSearchRepository(app.okHttpClient) }
             var searchQuery by rememberSaveable { mutableStateOf("") }
+            // Shorts opened from Search carry a unique token so selecting the same Short
+            // twice still counts as a fresh request.
+            var requestedShort by remember { mutableStateOf<ShortLaunchRequest?>(null) }
+            var shortLaunchToken by remember { mutableIntStateOf(0) }
 
             // Menus and dialogs use popup windows, so their back callbacks can run in
             // addition to the root handler. Children register here while they are open
@@ -625,19 +651,37 @@ class MainActivity : ComponentActivity() {
                                                 onQueryChange = { searchQuery = it },
                                                 searchRepo = searchRepo,
                                                 okHttpClient = app.okHttpClient,
+                                                downloadManager = downloadManager,
                                                 subscribedChannelIds = subscriptions.map { it.channelId }.toSet(),
                                                 hazeState = hazeState,
                                                 glassStyle = sharedGlassStyle,
                                                 isPageActive = pagerState.currentPage == AppTab.SEARCH.ordinal,
                                                 topContentPadding = feedTopClearance,
                                                 bottomContentPadding = feedBottomClearance,
+                                                preferredAudioLanguage = userSettings.preferredAudioLanguage,
+                                                defaultDownloadQuality = DownloadQuality.fromSettings(
+                                                    context.currentDownloadMaxHeight(userSettings),
+                                                    context.currentDownloadTargetFps(userSettings)
+                                                ).name,
+                                                allowHighResDownloads = userSettings.allowHighResContent,
                                                 onPlayVideo = { id, title, channel ->
                                                     openQueueVideo(QueueVideoItem(id, title, channel))
                                                 },
-                                                onPlayShort = {
-                                                    scope.launch {
-                                                        pagerState.animateScrollToPage(AppTab.SHORTS.ordinal)
-                                                    }
+                                                onPlayShort = { videoId, title, channelId, channelTitle ->
+                                                    shortLaunchToken += 1
+                                                    requestedShort = ShortLaunchRequest(
+                                                        token = shortLaunchToken,
+                                                        videoId = videoId,
+                                                        title = title,
+                                                        channelId = channelId,
+                                                        channelTitle = channelTitle
+                                                    )
+                                                    selectTab(AppTab.SHORTS.ordinal)
+                                                },
+                                                onOpenChannel = { channelId, channelTitle ->
+                                                    navController.navigate(
+                                                        "channel/$channelId?name=${Uri.encode(channelTitle)}"
+                                                    )
                                                 },
                                                 onToggleSubscribe = { channelId, channelTitle ->
                                                     scope.launch {
@@ -649,7 +693,8 @@ class MainActivity : ComponentActivity() {
                                                             )
                                                         }
                                                     }
-                                                }
+                                                },
+                                                onBackOverlayChanged = { key, visible -> setBackOverlay(key, visible) }
                                             )
 
                                             AppTab.DOWNLOADS -> DownloadsScreen(
@@ -686,6 +731,10 @@ class MainActivity : ComponentActivity() {
                                             AppTab.SHORTS -> ShortsScreen(
                                                 viewModel = shortsViewModel,
                                                 reloadTick = tabReloadTicks[AppTab.SHORTS.ordinal],
+                                                requestedShort = requestedShort,
+                                                onRequestedShortHandled = { token ->
+                                                    if (requestedShort?.token == token) requestedShort = null
+                                                },
                                                 shorts = liveShorts,
                                                 isLoading = isLoadingShorts,
                                                 errorMessage = shortsErrorMessage,
@@ -739,15 +788,6 @@ class MainActivity : ComponentActivity() {
                                                 },
                                                 onSponsorBlockChanged = { enabled ->
                                                     scope.launch { settingsRepository.updateSponsorBlock(enabled) }
-                                                },
-                                                onCategoriesChanged = { categories ->
-                                                    scope.launch { settingsRepository.updateSelectedCategories(categories) }
-                                                },
-                                                onCustomCategoriesChanged = { customs ->
-                                                    scope.launch { settingsRepository.updateCustomCategories(customs) }
-                                                },
-                                                onRepeatCooldownChanged = { cooldown ->
-                                                    scope.launch { settingsRepository.updateRepeatCooldown(cooldown) }
                                                 },
                                                 onAudioLanguageChanged = { code ->
                                                     scope.launch { settingsRepository.updatePreferredAudioLanguage(code) }
@@ -871,6 +911,17 @@ class MainActivity : ComponentActivity() {
                                             onBack = { navController.popBackStack() },
                                             onVideoClick = { videoId ->
                                                 openQueueVideo(QueueVideoItem(videoId, "Video", subscription.name))
+                                            },
+                                            onShortClick = { videoId, title, channelId, channelTitle ->
+                                                shortLaunchToken += 1
+                                                requestedShort = ShortLaunchRequest(
+                                                    token = shortLaunchToken,
+                                                    videoId = videoId,
+                                                    title = title,
+                                                    channelId = channelId.ifBlank { subscription.channelId },
+                                                    channelTitle = channelTitle.ifBlank { subscription.name }
+                                                )
+                                                selectTab(AppTab.SHORTS.ordinal)
                                             },
                                             isSubscribed = channelId in subscriptions.map { it.channelId },
                                             onToggleSubscribe = {

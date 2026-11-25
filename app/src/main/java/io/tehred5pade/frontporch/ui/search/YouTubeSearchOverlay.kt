@@ -1,11 +1,29 @@
 package io.tehred5pade.frontporch.ui.search
 
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.core.*
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -20,17 +38,35 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
@@ -39,15 +75,19 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
+import io.tehred5pade.frontporch.data.download.VideoDownloadManager
+import io.tehred5pade.frontporch.data.innertube.FeedVideoItem
 import io.tehred5pade.frontporch.data.search.SearchFilter
 import io.tehred5pade.frontporch.data.search.SearchSort
 import io.tehred5pade.frontporch.data.search.YouTubeSearchRepository
 import io.tehred5pade.frontporch.data.search.YouTubeSearchResult
 import io.tehred5pade.frontporch.ui.common.InlineMenu
 import io.tehred5pade.frontporch.ui.common.frostedGlass
+import io.tehred5pade.frontporch.ui.downloads.DownloadQuality
+import io.tehred5pade.frontporch.ui.downloads.DownloadQualityDialog
 import io.tehred5pade.frontporch.ui.feed.YouTubeThumbnail
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.HazeStyle
 import kotlinx.coroutines.delay
 import okhttp3.OkHttpClient
 
@@ -243,25 +283,63 @@ private fun SearchPillButton(
     }
 }
 
+/** Search results and feed videos are different types; bridge them for the download pipeline. */
+private fun YouTubeSearchResult.Video.toFeedVideoItem(): FeedVideoItem = FeedVideoItem(
+    videoId = id,
+    title = title,
+    channelId = channelId,
+    channelName = channelName,
+    publishedIso = "",
+    publishedEpochMs = 0L,
+    thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+    isShort = false,
+    views = -1L,
+    durationSeconds = durationText.toDurationSeconds()
+)
+
+private fun String.toDurationSeconds(): Int {
+    val parts = trim().split(':').mapNotNull { it.toIntOrNull() }
+    return when (parts.size) {
+        2 -> parts[0] * 60 + parts[1]
+        3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
+        else -> 0
+    }
+}
+
 @Composable
 fun YouTubeSearchResultsScreen(
     query: String,
     searchRepo: YouTubeSearchRepository,
     okHttpClient: OkHttpClient,
+    downloadManager: VideoDownloadManager,
     subscribedChannelIds: Set<String>,
     hazeState: HazeState? = null,
     glassStyle: HazeStyle? = null,
     topContentPadding: Dp = 0.dp,
     bottomContentPadding: Dp = 0.dp,
+    preferredAudioLanguage: String = "en",
+    defaultDownloadQuality: String = DownloadQuality.BEST_AVAILABLE.name,
+    allowHighResDownloads: Boolean = true,
     onPlayVideo: (videoId: String, title: String, channelName: String) -> Unit,
-    onPlayShort: (videoId: String) -> Unit,
+    onPlayShort: (
+        videoId: String,
+        title: String,
+        channelId: String,
+        channelTitle: String
+    ) -> Unit,
+    onOpenChannel: (channelId: String, channelTitle: String) -> Unit,
     onToggleSubscribe: (channelId: String, channelTitle: String) -> Unit,
+    onBackOverlayChanged: (String, Boolean) -> Unit = { _, _ -> },
     onDismiss: () -> Unit,
     // The pager keeps every tab mounted, so only the visible Search page may intercept back.
     handleBack: Boolean = true
 ) {
     val scheme = MaterialTheme.colorScheme
+    val context = LocalContext.current
     val listState = rememberLazyListState()
+
+    var pendingDownloadVideo by remember { mutableStateOf<FeedVideoItem?>(null) }
+    var availableDownloadQualities by remember { mutableStateOf<Set<DownloadQuality>?>(null) }
 
     var selectedFilter by remember { mutableStateOf(SearchFilter.ALL) }
     var selectedSort by remember { mutableStateOf(SearchSort.RELEVANCE) }
@@ -283,7 +361,27 @@ fun YouTubeSearchResultsScreen(
         derivedStateOf { allResults.take(visibleCount.coerceAtMost(allResults.size)) }
     }
 
-    BackHandler(enabled = handleBack) { onDismiss() }
+    // The quality dialog must own the first back event instead of clearing the search.
+    BackHandler(enabled = handleBack && pendingDownloadVideo == null) { onDismiss() }
+
+    DisposableEffect(pendingDownloadVideo != null) {
+        onBackOverlayChanged("search-download-quality-dialog", pendingDownloadVideo != null)
+        onDispose { onBackOverlayChanged("search-download-quality-dialog", false) }
+    }
+
+    // Probe the actual streams before offering qualities, matching the Feed download flow.
+    LaunchedEffect(pendingDownloadVideo) {
+        val target = pendingDownloadVideo
+        if (target == null) {
+            availableDownloadQualities = null
+            return@LaunchedEffect
+        }
+        availableDownloadQualities = null
+        val probed = downloadManager.probeAvailableDownloadQualities(listOf(target))
+        availableDownloadQualities = probed.ifEmpty {
+            DownloadQuality.allowedDownloadQualities(allowHighResDownloads).toSet()
+        }
+    }
 
     // Reload from page one when the query, category filter, or sort order changes.
     LaunchedEffect(query, selectedFilter, selectedSort) {
@@ -382,6 +480,40 @@ fun YouTubeSearchResultsScreen(
             // trigger the next page on its own.
             loadMoreTick++
         }
+    }
+
+    val downloadTarget = pendingDownloadVideo
+    if (downloadTarget != null) {
+        DownloadQualityDialog(
+            videoCount = 1,
+            defaultQualityName = defaultDownloadQuality,
+            availableQualities = availableDownloadQualities,
+            allowHighResDownloads = allowHighResDownloads,
+            hazeState = hazeState,
+            glassStyle = glassStyle,
+            onDismiss = { pendingDownloadVideo = null },
+            onConfirm = { quality ->
+                pendingDownloadVideo = null
+                val effectiveQuality = if (
+                    !allowHighResDownloads &&
+                    (quality == DownloadQuality.BEST_AVAILABLE || DownloadQuality.isHighRes(quality))
+                ) {
+                    DownloadQuality.BEST_AVAILABLE_HD
+                } else {
+                    quality
+                }
+                downloadManager.enqueueVideos(
+                    listOf(downloadTarget),
+                    effectiveQuality,
+                    preferredAudioLanguage
+                )
+                Toast.makeText(
+                    context,
+                    "Downloading \"${downloadTarget.title}\" (${effectiveQuality.label})",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        )
     }
 
     Column(
@@ -532,20 +664,29 @@ fun YouTubeSearchResultsScreen(
                                 SearchVideoRow(
                                     video = item,
                                     okHttpClient = okHttpClient,
-                                    onClick = { onPlayVideo(item.id, item.title, item.channelName) }
+                                    onClick = { onPlayVideo(item.id, item.title, item.channelName) },
+                                    onDownload = { pendingDownloadVideo = item.toFeedVideoItem() }
                                 )
                             }
                             is YouTubeSearchResult.Short -> {
                                 SearchShortRow(
                                     shortItem = item,
                                     okHttpClient = okHttpClient,
-                                    onClick = { onPlayShort(item.id) }
+                                    onClick = {
+                                        onPlayShort(
+                                            item.id,
+                                            item.title,
+                                            item.channelId,
+                                            item.channelTitle
+                                        )
+                                    }
                                 )
                             }
                             is YouTubeSearchResult.Channel -> {
                                 SearchChannelRow(
                                     channel = item,
                                     isSubscribed = item.id in subscribedChannelIds,
+                                    onOpenChannel = { onOpenChannel(item.id, item.title) },
                                     onToggleSubscribe = { onToggleSubscribe(item.id, item.title) },
                                     hazeState = hazeState,
                                     glassStyle = glassStyle
@@ -579,7 +720,8 @@ fun YouTubeSearchResultsScreen(
 private fun SearchVideoRow(
     video: YouTubeSearchResult.Video,
     okHttpClient: OkHttpClient,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onDownload: () -> Unit
 ) {
     val scheme = MaterialTheme.colorScheme
     Row(
@@ -587,67 +729,86 @@ private fun SearchVideoRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
             .padding(4.dp)
     ) {
-        Box(
+        Row(
+            verticalAlignment = Alignment.Top,
             modifier = Modifier
-                .width(156.dp)
-                .aspectRatio(16f / 9f)
-                .clip(RoundedCornerShape(10.dp))
-                .background(Color.Black)
+                .weight(1f)
+                .clickable(onClick = onClick)
         ) {
-            YouTubeThumbnail(
-                videoId = video.id,
-                contentDescription = video.title,
-                okHttpClient = okHttpClient,
-                modifier = Modifier.fillMaxSize()
-            )
-            if (video.durationText.isNotBlank()) {
-                Surface(
-                    color = Color.Black.copy(alpha = 0.82f),
-                    shape = RoundedCornerShape(4.dp),
+                Box(
                     modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(6.dp)
+                        .width(156.dp)
+                        .aspectRatio(16f / 9f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color.Black)
                 ) {
-                    Text(
-                        text = video.durationText,
-                        color = Color.White,
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                    YouTubeThumbnail(
+                        videoId = video.id,
+                        contentDescription = video.title,
+                        okHttpClient = okHttpClient,
+                        modifier = Modifier.fillMaxSize()
                     )
+                    if (video.durationText.isNotBlank()) {
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.82f),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(6.dp)
+                        ) {
+                            Text(
+                                text = video.durationText,
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
                 }
-            }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = video.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = scheme.onBackground,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = video.channelName,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = scheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (video.metaText.isNotBlank()) {
+                        Text(
+                            text = video.metaText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = scheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
         }
-
-        Spacer(modifier = Modifier.width(12.dp))
-
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = video.title,
-                style = MaterialTheme.typography.titleSmall,
-                color = scheme.onBackground,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
+        Spacer(modifier = Modifier.width(4.dp))
+        IconButton(
+            onClick = onDownload,
+            modifier = Modifier
+                .size(40.dp)
+                .align(Alignment.CenterVertically)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Download,
+                contentDescription = "Download ${video.title}",
+                tint = scheme.onSurfaceVariant
             )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = video.channelName,
-                style = MaterialTheme.typography.labelMedium,
-                color = scheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            if (video.metaText.isNotBlank()) {
-                Text(
-                    text = video.metaText,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = scheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
         }
     }
 }
@@ -723,6 +884,7 @@ private fun SearchShortRow(
 private fun SearchChannelRow(
     channel: YouTubeSearchResult.Channel,
     isSubscribed: Boolean,
+    onOpenChannel: () -> Unit,
     onToggleSubscribe: () -> Unit,
     hazeState: HazeState?,
     glassStyle: HazeStyle?
@@ -734,6 +896,7 @@ private fun SearchChannelRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(scheme.surfaceVariant.copy(alpha = 0.55f))
+            .clickable(onClick = onOpenChannel)
             .padding(horizontal = 12.dp, vertical = 10.dp)
     ) {
         Box(

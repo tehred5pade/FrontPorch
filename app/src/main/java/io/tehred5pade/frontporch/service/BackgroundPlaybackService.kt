@@ -8,10 +8,10 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
-import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.IBinder
 import android.support.v4.media.MediaMetadataCompat
@@ -22,7 +22,12 @@ import androidx.core.app.ServiceCompat
 import androidx.media.app.NotificationCompat.MediaStyle
 import androidx.media.session.MediaButtonReceiver
 import io.tehred5pade.frontporch.MainActivity
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.net.URL
 
 class BackgroundPlaybackService : Service() {

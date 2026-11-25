@@ -10,9 +10,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import io.tehred5pade.frontporch.data.search.YouTubeSearchRepository
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
+import io.tehred5pade.frontporch.data.download.VideoDownloadManager
+import io.tehred5pade.frontporch.data.search.YouTubeSearchRepository
+import io.tehred5pade.frontporch.ui.downloads.DownloadQuality
 import okhttp3.OkHttpClient
 
 /**
@@ -28,15 +30,26 @@ fun SearchScreen(
     onQueryChange: (String) -> Unit,
     searchRepo: YouTubeSearchRepository,
     okHttpClient: OkHttpClient,
+    downloadManager: VideoDownloadManager,
     subscribedChannelIds: Set<String>,
     hazeState: HazeState,
     glassStyle: HazeStyle,
     isPageActive: Boolean,
     topContentPadding: Dp = 0.dp,
     bottomContentPadding: Dp = 0.dp,
+    preferredAudioLanguage: String = "en",
+    defaultDownloadQuality: String = DownloadQuality.BEST_AVAILABLE.name,
+    allowHighResDownloads: Boolean = true,
     onPlayVideo: (videoId: String, title: String, channelName: String) -> Unit,
-    onPlayShort: (videoId: String) -> Unit,
-    onToggleSubscribe: (channelId: String, channelTitle: String) -> Unit
+    onPlayShort: (
+        videoId: String,
+        title: String,
+        channelId: String,
+        channelTitle: String
+    ) -> Unit,
+    onOpenChannel: (channelId: String, channelTitle: String) -> Unit,
+    onToggleSubscribe: (channelId: String, channelTitle: String) -> Unit,
+    onBackOverlayChanged: (String, Boolean) -> Unit = { _, _ -> }
 ) {
     Column(
         modifier = Modifier
@@ -63,14 +76,20 @@ fun SearchScreen(
             query = query,
             searchRepo = searchRepo,
             okHttpClient = okHttpClient,
+            downloadManager = downloadManager,
             subscribedChannelIds = subscribedChannelIds,
             hazeState = hazeState,
             glassStyle = glassStyle,
             topContentPadding = 8.dp,
             bottomContentPadding = bottomContentPadding,
+            preferredAudioLanguage = preferredAudioLanguage,
+            defaultDownloadQuality = defaultDownloadQuality,
+            allowHighResDownloads = allowHighResDownloads,
             onPlayVideo = onPlayVideo,
             onPlayShort = onPlayShort,
+            onOpenChannel = onOpenChannel,
             onToggleSubscribe = onToggleSubscribe,
+            onBackOverlayChanged = onBackOverlayChanged,
             onDismiss = { onQueryChange("") },
             handleBack = isPageActive && query.isNotBlank()
         )

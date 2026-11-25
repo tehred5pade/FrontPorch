@@ -2,21 +2,47 @@ package io.tehred5pade.frontporch.ui.player
 
 import android.content.res.Configuration
 import android.net.Uri
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.view.LayoutInflater
 import android.view.ViewGroup
-import io.tehred5pade.frontporch.R
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import androidx.annotation.OptIn
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -44,18 +70,23 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.ui.PlayerView
+import io.tehred5pade.frontporch.R
 import io.tehred5pade.frontporch.ResolvedStream
-import io.tehred5pade.frontporch.data.innertube.*
+import io.tehred5pade.frontporch.data.innertube.CaptionTrack
+import io.tehred5pade.frontporch.data.innertube.FullVideoDetails
+import io.tehred5pade.frontporch.data.innertube.InnerTubeVideoService
+import io.tehred5pade.frontporch.data.innertube.PlayableCandidate
+import io.tehred5pade.frontporch.data.innertube.VideoComment
+import io.tehred5pade.frontporch.data.innertube.formatDurationSeconds
 import io.tehred5pade.frontporch.data.local.WatchProgressRepository
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockRepository
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.service.PlaybackSessionHolder
-import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -63,6 +94,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import org.json.JSONObject
+import java.util.Locale
 
 private class PlaybackSnapshot(
     var posMs: Long = 0L,
@@ -202,6 +234,7 @@ fun VideoPlayerScreen(
             .build()
             .apply {
                 playWhenReady = true
+                repeatMode = Player.REPEAT_MODE_OFF
                 trackSelectionParameters = trackSelectionParameters
                     .buildUpon()
                     .apply {
@@ -216,6 +249,9 @@ fun VideoPlayerScreen(
                 addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         if (playbackState == Player.STATE_ENDED) {
+                            // Never replay the same stream while the end handler runs.
+                            playWhenReady = false
+                            pause()
                             onPlaybackEndedUpdated.value()
                         }
                     }
@@ -754,6 +790,7 @@ fun VideoPlayerScreen(
             val c = fallbackChannel.orEmpty()
             val fileUri = runCatching { Uri.parse(localVideoPath) }.getOrNull() ?: Uri.EMPTY
             exoPlayer.setMediaItem(MediaItem.fromUri(fileUri))
+            exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
             exoPlayer.prepare()
             exoPlayer.play()
             PlaybackSessionHolder.attachOfflinePlayer(

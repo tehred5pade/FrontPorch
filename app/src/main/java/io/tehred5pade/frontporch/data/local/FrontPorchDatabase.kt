@@ -1,7 +1,15 @@
 package io.tehred5pade.frontporch.data.local
 
 import android.content.Context
-import androidx.room.*
+import androidx.room.Dao
+import androidx.room.Database
+import androidx.room.Entity
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.PrimaryKey
+import androidx.room.Query
+import androidx.room.Room
+import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import io.tehred5pade.frontporch.data.db.SubscriptionDao
@@ -76,9 +84,14 @@ interface DownloadsDao {
         WatchHistoryEntity::class,
         DownloadEntity::class,
         DownloadedVideoEntity::class,
-        CachedFeedVideoEntity::class
+        CachedFeedVideoEntity::class,
+        ShortFeedbackEntity::class,
+        ChannelAffinityEntity::class,
+        TagAffinityEntity::class,
+        SeenShortEntity::class,
+        AffinityScoreEntity::class
     ],
-    version = 8,
+    version = 9,
     exportSchema = false
 )
 abstract class FrontPorchDatabase : RoomDatabase() {
@@ -87,6 +100,7 @@ abstract class FrontPorchDatabase : RoomDatabase() {
     abstract fun downloadsDao(): DownloadsDao
     abstract fun downloadedVideoDao(): DownloadedVideoDao
     abstract fun cachedFeedVideoDao(): CachedFeedVideoDao
+    abstract fun recommendationDao(): RecommendationDao
 
     companion object {
         @Volatile
@@ -156,6 +170,71 @@ abstract class FrontPorchDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `short_feedback` (
+                        `videoId` TEXT NOT NULL,
+                        `channelId` TEXT NOT NULL,
+                        `channelName` TEXT NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `tags` TEXT NOT NULL,
+                        `feedbackType` TEXT NOT NULL,
+                        `timestamp` INTEGER NOT NULL,
+                        PRIMARY KEY(`videoId`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `channel_affinities` (
+                        `channelId` TEXT NOT NULL,
+                        `channelName` TEXT NOT NULL,
+                        `score` REAL NOT NULL,
+                        `lastUpdated` INTEGER NOT NULL,
+                        PRIMARY KEY(`channelId`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `tag_affinities` (
+                        `tag` TEXT NOT NULL,
+                        `score` REAL NOT NULL,
+                        `lastUpdated` INTEGER NOT NULL,
+                        PRIMARY KEY(`tag`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `seen_shorts` (
+                        `videoId` TEXT NOT NULL,
+                        `timestamp` INTEGER NOT NULL,
+                        `completionPercent` REAL NOT NULL DEFAULT 0.0,
+                        `implicitApplied` INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(`videoId`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `affinity_scores` (
+                        `affinityKey` TEXT NOT NULL,
+                        `type` TEXT NOT NULL,
+                        `label` TEXT NOT NULL,
+                        `score` REAL NOT NULL,
+                        `dislikeCount` INTEGER NOT NULL,
+                        `muted` INTEGER NOT NULL,
+                        `lastUpdated` INTEGER NOT NULL,
+                        PRIMARY KEY(`affinityKey`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getDatabase(context: Context): FrontPorchDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -163,14 +242,7 @@ abstract class FrontPorchDatabase : RoomDatabase() {
                     FrontPorchDatabase::class.java,
                     "front_porch_database"
                 )
-                .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, object : Migration(7, 8) {
-                    override fun migrate(db: SupportSQLiteDatabase) {
-                        db.execSQL(
-                            "ALTER TABLE `downloaded_videos` " +
-                                "ADD COLUMN `isWatched` INTEGER NOT NULL DEFAULT 0"
-                        )
-                    }
-                })
+                .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_8_9)
                 .fallbackToDestructiveMigration()
                 .build()
                 INSTANCE = instance

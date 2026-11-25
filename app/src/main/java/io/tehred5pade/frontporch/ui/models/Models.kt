@@ -24,7 +24,15 @@ data class ShortItem(
     val likesCount: String = "",
     val resolvedStream: ResolvedStream? = null,
     val resolvedCaptions: List<CaptionTrack> = emptyList(),
-    val channelId: String = ""
+    val channelId: String = "",
+    /** Runtime in seconds. 0 means YouTube did not expose a length for this item. */
+    val durationSeconds: Int = 0,
+    /**
+     * True when the source explicitly identified the item as short-form (reel endpoint,
+     * channel Shorts tab, or reel watch sequence). Shorts validity accepts this as an
+     * alternative to a measured duration.
+     */
+    val isShortForm: Boolean = false
 )
 
 data class CommentItem(

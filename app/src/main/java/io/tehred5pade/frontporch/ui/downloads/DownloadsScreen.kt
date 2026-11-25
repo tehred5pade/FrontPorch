@@ -4,29 +4,41 @@ import android.content.res.Configuration
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.view.LayoutInflater
-import io.tehred5pade.frontporch.R
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.documentfile.provider.DocumentFile
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.items as gridItems
-import androidx.compose.foundation.lazy.grid.GridItemSpan
-import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.automirrored.filled.Sort
@@ -35,61 +47,88 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import io.tehred5pade.frontporch.ui.player.PlayerGestureOverlay
-import io.tehred5pade.frontporch.ui.player.SegmentedDotScrubber
-import io.tehred5pade.frontporch.data.innertube.formatDurationSeconds
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.zIndex
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
+import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
+import io.tehred5pade.frontporch.R
 import io.tehred5pade.frontporch.data.download.VideoDownloadManager
+import io.tehred5pade.frontporch.data.innertube.formatDurationSeconds
 import io.tehred5pade.frontporch.data.local.DownloadedVideoDao
 import io.tehred5pade.frontporch.data.local.DownloadedVideoEntity
 import io.tehred5pade.frontporch.data.local.WatchProgressRepository
 import io.tehred5pade.frontporch.data.playlist.PlaylistEntry
 import io.tehred5pade.frontporch.data.playlist.PlaylistStore
-import io.tehred5pade.frontporch.ui.common.InlineMenu
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockRepository
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.service.PlaybackSessionHolder
+import io.tehred5pade.frontporch.ui.common.InlineMenu
+import io.tehred5pade.frontporch.ui.common.frostedGlass
 import io.tehred5pade.frontporch.ui.feed.DurationBadge
 import io.tehred5pade.frontporch.ui.feed.WatchProgressBar
-import io.tehred5pade.frontporch.ui.playlist.PlaylistDialog
 import io.tehred5pade.frontporch.ui.player.KeepScreenOnEffect
-import io.tehred5pade.frontporch.ui.common.frostedGlass
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.HazeStyle
+import io.tehred5pade.frontporch.ui.player.PlayerGestureOverlay
+import io.tehred5pade.frontporch.ui.player.SegmentedDotScrubber
+import io.tehred5pade.frontporch.ui.playlist.PlaylistDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.File
-import java.util.Locale
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 
 /** Deletes the Room record together with the local video and thumbnail files. */
 suspend fun deleteDownloadedVideos(
@@ -190,6 +229,7 @@ fun DownloadsScreen(
     var menuExpandedForId by remember { mutableStateOf<String?>(null) }
     var showPlaylistDialog by remember { mutableStateOf(false) }
     var playlistDialogEntry by remember { mutableStateOf<PlaylistEntry?>(null) }
+    var selectedErrorText by remember { mutableStateOf<String?>(null) }
 
     // Snapshot of the ordered list + starting index so DB updates at 90% don't interrupt playback
     var activePlaylist by remember { mutableStateOf<List<DownloadedVideoEntity>>(emptyList()) }
@@ -344,7 +384,12 @@ fun DownloadsScreen(
                         Text(
                             text = "${active.channelName} • ${active.qualityLabel} • ${active.statusText}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = scheme.onSurfaceVariant
+                            color = if (active.isFailed) MaterialTheme.colorScheme.error else scheme.onSurfaceVariant,
+                            modifier = Modifier.let {
+                                if (active.isFailed) {
+                                    it.clickable { selectedErrorText = active.statusText }
+                                } else it
+                            }
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(
@@ -357,13 +402,31 @@ fun DownloadsScreen(
                                     .weight(1f)
                                     .padding(end = 8.dp)
                             )
+                            if (active.isFailed) {
+                                TextButton(
+                                    onClick = { downloadManager.retryDownload(active.videoId) },
+                                    modifier = Modifier.padding(end = 4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Refresh,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(text = "Retry")
+                                }
+                            }
                             IconButton(
                                 onClick = { downloadManager.cancelDownload(active.videoId) },
                                 modifier = Modifier.size(32.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Filled.Close,
-                                    contentDescription = "Cancel download",
+                                    contentDescription = if (active.isFailed) {
+                                        "Remove failed download"
+                                    } else {
+                                        "Cancel download"
+                                    },
                                     tint = scheme.onSurfaceVariant,
                                     modifier = Modifier.size(20.dp)
                                 )
@@ -677,6 +740,26 @@ fun DownloadsScreen(
             }
         }
     }
+
+    if (selectedErrorText != null) {
+        AlertDialog(
+            onDismissRequest = { selectedErrorText = null },
+            title = { Text("Download Error Details") },
+            text = {
+                SelectionContainer {
+                    Text(
+                        text = selectedErrorText ?: "",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { selectedErrorText = null }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -869,7 +952,11 @@ fun OfflineVideoPlayer(
         ExoPlayer.Builder(context)
             .setVideoChangeFrameRateStrategy(C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_ONLY_IF_SEAMLESS)
             .build()
-            .apply { playWhenReady = true }
+            .apply {
+                playWhenReady = true
+                // Downloaded videos play once; reaching the end closes instead of looping.
+                repeatMode = Player.REPEAT_MODE_OFF
+            }
     }
 
     var isPlaying by remember { mutableStateOf(true) }
@@ -882,6 +969,7 @@ fun OfflineVideoPlayer(
         val fileUri = runCatching { Uri.parse(currentVideo.localVideoPath) }.getOrNull()
             ?: Uri.fromFile(File(currentVideo.localVideoPath))
         exoPlayer.setMediaItem(MediaItem.fromUri(fileUri))
+        exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
         PlaybackSessionHolder.attachOfflinePlayer(
@@ -911,6 +999,9 @@ fun OfflineVideoPlayer(
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
+                    // Freeze at the end so a late recomposition cannot restart the file.
+                    exoPlayer.playWhenReady = false
+                    exoPlayer.pause()
                     if (currentVideo.videoId !in markedWatchedIds) {
                         markedWatchedIds.add(currentVideo.videoId)
                         onMarkVideoWatched(currentVideo.videoId)

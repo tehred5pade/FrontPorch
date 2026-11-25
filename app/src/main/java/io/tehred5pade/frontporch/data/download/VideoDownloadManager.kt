@@ -1,57 +1,77 @@
 package io.tehred5pade.frontporch.data.download
 
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
-import android.media.*
-import android.net.Uri
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.annotation.OptIn
 import androidx.documentfile.provider.DocumentFile
-import io.tehred5pade.frontporch.service.DownloadForegroundService
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.muxer.MediaMuxerCompat
 import io.tehred5pade.frontporch.data.innertube.FeedVideoItem
 import io.tehred5pade.frontporch.data.local.DownloadedVideoDao
 import io.tehred5pade.frontporch.data.local.DownloadedVideoEntity
-import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
-import io.tehred5pade.frontporch.data.sponsorblock.SponsorCategory
-import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
-import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
+import io.tehred5pade.frontporch.service.DownloadForegroundService
 import io.tehred5pade.frontporch.ui.downloads.DownloadQuality
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
-import okhttp3.Response
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
-import org.schabi.newpipe.extractor.MediaFormat as NewPipeMediaFormat
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.downloader.Downloader
-import org.schabi.newpipe.extractor.downloader.Request as NewPipeRequest
-import org.schabi.newpipe.extractor.downloader.Response as NewPipeResponse
 import org.schabi.newpipe.extractor.localization.Localization
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
-import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import org.schabi.newpipe.extractor.MediaFormat as NewPipeMediaFormat
+import org.schabi.newpipe.extractor.downloader.Request as NewPipeRequest
+import org.schabi.newpipe.extractor.downloader.Response as NewPipeResponse
 
 data class ActiveDownloadItem(
     val videoId: String,
@@ -59,11 +79,13 @@ data class ActiveDownloadItem(
     val channelName: String,
     val qualityLabel: String,
     val progress: Float,
-    val statusText: String
+    val statusText: String,
+    /** Failed downloads stay visible so the user can retry them. */
+    val isFailed: Boolean = false
 )
 
 /**
- * Coroutine cancellation alone cannot interrupt the blocking OkHttp/MediaMuxer work in a
+ * Coroutine cancellation alone cannot interrupt the blocking OkHttp/muxer work in a
  * download. Each download owns one of these so [cancelDownload] can abort the in-flight
  * requests and stop the pipeline before the result is written to the downloads folder.
  */
@@ -114,10 +136,11 @@ private fun Call.executeCancellable(cancellation: DownloadCancellation): Respons
  */
 private class ThrottledProgress(
     private val intervalMs: Long = 250L,
+    private val initialBytes: Long = 0L,
     private val onReport: (Float, Long) -> Unit
 ) {
     private val lastReportMs = AtomicLong(0L)
-    private val lastBytes = AtomicLong(0L)
+    private val lastBytes = AtomicLong(initialBytes)
     @Volatile private var lastSpeedBps = 0L
 
     fun report(fraction: Float, bytes: Long) {
@@ -142,6 +165,77 @@ private fun formatSpeed(bytesPerSecond: Long): String = when {
     bytesPerSecond >= 1_000_000 -> "%.1f MB/s".format(bytesPerSecond / 1_000_000f)
     bytesPerSecond >= 1_000 -> "%.0f KB/s".format(bytesPerSecond / 1_000f)
     else -> "$bytesPerSecond B/s"
+}
+
+/**
+ * Small sidecar files describe which parts of a temp file are safe to reuse. Without them a
+ * preallocated ranged download looks "complete" by length even though most chunks are holes.
+ */
+private sealed interface DownloadPartState {
+    data class Direct(
+        val identity: String,
+        val totalBytes: Long,
+        val chunkSize: Long,
+        val chunkCount: Int,
+        val completedChunks: Set<Int>
+    ) : DownloadPartState
+
+    data class Hls(
+        val identity: String,
+        val segmentCount: Int,
+        val completedSegments: Int,
+        val completedBytes: Long
+    ) : DownloadPartState
+}
+
+private fun streamIdentity(url: String): String =
+    url.substringBefore('?').replace("|", "%7C")
+
+private fun serializeDownloadPartState(state: DownloadPartState): String = when (state) {
+    is DownloadPartState.Direct -> listOf(
+        "direct",
+        state.identity,
+        state.totalBytes.toString(),
+        state.chunkSize.toString(),
+        state.chunkCount.toString(),
+        state.completedChunks.sorted().joinToString(",")
+    ).joinToString("|")
+
+    is DownloadPartState.Hls -> listOf(
+        "hls",
+        state.identity,
+        state.segmentCount.toString(),
+        state.completedSegments.toString(),
+        state.completedBytes.toString()
+    ).joinToString("|")
+}
+
+private fun parseDownloadPartState(raw: String): DownloadPartState? {
+    val parts = raw.trim().split("|")
+    return when (parts.getOrNull(0)) {
+        "direct" -> {
+            val completed = parts.getOrNull(5).orEmpty()
+                .split(',')
+                .mapNotNull { it.trim().toIntOrNull() }
+                .toSet()
+            DownloadPartState.Direct(
+                identity = parts.getOrNull(1).orEmpty(),
+                totalBytes = parts.getOrNull(2)?.toLongOrNull() ?: return null,
+                chunkSize = parts.getOrNull(3)?.toLongOrNull() ?: return null,
+                chunkCount = parts.getOrNull(4)?.toIntOrNull() ?: return null,
+                completedChunks = completed
+            )
+        }
+
+        "hls" -> DownloadPartState.Hls(
+            identity = parts.getOrNull(1).orEmpty(),
+            segmentCount = parts.getOrNull(2)?.toIntOrNull() ?: return null,
+            completedSegments = parts.getOrNull(3)?.toIntOrNull() ?: return null,
+            completedBytes = parts.getOrNull(4)?.toLongOrNull() ?: return null
+        )
+
+        else -> null
+    }
 }
 
 data class VideoFormatCandidate(
@@ -269,6 +363,10 @@ class VideoDownloadManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val settingsStore = DownloadSettingsStore(context)
 
+    companion object {
+        private const val TAG = "VideoDownloadManager"
+    }
+
     // Each video can use several parallel connections. Limit simultaneous videos so a
     // large batch does not saturate the disk/TLS layer and slow every transfer down.
     private val videoDownloadSlots = Semaphore(3)
@@ -291,11 +389,59 @@ class VideoDownloadManager(
     private val _activeDownloads = MutableStateFlow<Map<String, ActiveDownloadItem>>(emptyMap())
     val activeDownloads: StateFlow<Map<String, ActiveDownloadItem>> = _activeDownloads.asStateFlow()
 
+    /** Everything needed to start again after a failed attempt. */
+    private data class PendingDownload(
+        val video: FeedVideoItem,
+        val quality: DownloadQuality,
+        val preferredAudioLanguage: String
+    )
+
+    private val failedDownloads = ConcurrentHashMap<String, PendingDownload>()
+    private val stateFileLock = Any()
+
     private val thumbsDir: File
         get() = File(context.filesDir, "download_thumbs").apply { mkdirs() }
 
     private val tempWorkDir: File
         get() = File(context.cacheDir, "download_tmp").apply { mkdirs() }
+
+    private fun stateFileFor(destination: File): File = File(tempWorkDir, "${destination.name}.state")
+
+    private fun readPartState(destination: File): DownloadPartState? = synchronized(stateFileLock) {
+        val file = stateFileFor(destination)
+        if (!file.exists()) null else runCatching { parseDownloadPartState(file.readText()) }.getOrNull()
+    }
+
+    private fun writePartState(destination: File, state: DownloadPartState) {
+        synchronized(stateFileLock) {
+            val file = stateFileFor(destination)
+            val tmp = File(file.path + ".tmp")
+            runCatching {
+                tmp.writeText(serializeDownloadPartState(state))
+                if (!tmp.renameTo(file)) {
+                    file.writeText(serializeDownloadPartState(state))
+                    tmp.delete()
+                }
+            }
+        }
+    }
+
+    private fun deletePartState(destination: File) {
+        synchronized(stateFileLock) {
+            val file = stateFileFor(destination)
+            file.delete()
+            File(file.path + ".tmp").delete()
+        }
+    }
+
+    /** Removes only resumable temp artifacts; completed downloads are never touched. */
+    private fun clearTempArtifacts(videoId: String) {
+        listOf("${videoId}_v.mp4", "${videoId}_a.m4a", "${videoId}_out.mp4").forEach { name ->
+            val file = File(tempWorkDir, name)
+            file.delete()
+            deletePartState(file)
+        }
+    }
 
     /**
      * Reject empty or corrupt output before it is written to the downloads folder or the DB.
@@ -310,6 +456,7 @@ class VideoDownloadManager(
         try {
             extractor.setDataSource(file.absolutePath)
             var hasSamples = false
+            val checkBuffer = java.nio.ByteBuffer.allocateDirect(1024)
             for (i in 0 until extractor.trackCount) {
                 val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME).orEmpty()
                 val isVideo = mime.startsWith("video/")
@@ -317,7 +464,9 @@ class VideoDownloadManager(
                 if (!isVideo && !isAudio) continue
                 if (audioOnly && isVideo) continue
                 extractor.selectTrack(i)
-                if (extractor.sampleTime >= 0L) hasSamples = true
+                if (extractor.readSampleData(checkBuffer, 0) >= 0 || extractor.sampleTime >= 0L) {
+                    hasSamples = true
+                }
                 extractor.unselectTrack(i)
             }
             if (!hasSamples) throw IllegalStateException("Downloaded file has no playable media samples")
@@ -334,36 +483,155 @@ class VideoDownloadManager(
         downloadCancellations.remove(videoId)?.cancel()
         downloadJobs[videoId]?.cancel()
         downloadJobs.remove(videoId)
+        failedDownloads.remove(videoId)
         _activeDownloads.update { it - videoId }
-        runCatching {
-            File(tempWorkDir, "${videoId}_v.mp4").delete()
-            File(tempWorkDir, "${videoId}_a.m4a").delete()
-            File(tempWorkDir, "${videoId}_out.mp4").delete()
-        }
+        clearTempArtifacts(videoId)
     }
 
     fun enqueueVideos(videos: List<FeedVideoItem>, quality: DownloadQuality, preferredAudioLanguage: String = "en") {
-        val newDownloads = videos.filterNot { _activeDownloads.value.containsKey(it.videoId) }
-        if (newDownloads.isEmpty()) return
+        val current = _activeDownloads.value
+        val toStart = mutableListOf<FeedVideoItem>()
+
+        videos.forEach { video ->
+            val existing = current[video.videoId]
+            if (existing == null || existing.isFailed) {
+                // Re-enqueueing a failed download starts clean: the quality may have changed,
+                // and an explicit fresh request should not silently reuse old partial bytes.
+                if (existing?.isFailed == true) {
+                    failedDownloads.remove(video.videoId)
+                    clearTempArtifacts(video.videoId)
+                }
+                updateProgress(video, quality.label, 0.02f, "Resolving ${quality.label}...")
+                toStart.add(video)
+            }
+        }
+        if (toStart.isEmpty()) return
 
         // Publish the active state before starting the service so its first notification has
         // something to show. The manager remains the single source of truth for progress and
         // cancellation; the service only keeps the process alive after the user leaves the task.
-        newDownloads.forEach { video ->
-            updateProgress(video, quality.label, 0.02f, "Resolving ${quality.label}...")
-        }
         DownloadForegroundService.start(context.applicationContext)
+        toStart.forEach { video ->
+            launchDownload(video, quality, preferredAudioLanguage, resume = false)
+        }
+    }
 
-        newDownloads.forEach { video ->
-            val job = scope.launch {
-                videoDownloadSlots.withPermit {
-                    downloadSingle(video, quality, preferredAudioLanguage)
+    /** Retry starts from partial files and only clears them if the resume attempt fails. */
+    fun retryDownload(videoId: String) {
+        val pending = failedDownloads.remove(videoId) ?: return
+
+        val lastProgress = _activeDownloads.value[videoId]?.progress ?: 0f
+        updateProgress(
+            pending.video,
+            pending.quality.label,
+            lastProgress,
+            "Resuming ${pending.quality.label}..."
+        )
+        DownloadForegroundService.start(context.applicationContext)
+        launchDownload(
+            pending.video,
+            pending.quality,
+            pending.preferredAudioLanguage,
+            resume = true
+        )
+    }
+
+    private fun launchDownload(
+        video: FeedVideoItem,
+        quality: DownloadQuality,
+        preferredAudioLanguage: String,
+        resume: Boolean
+    ) {
+        val job = scope.launch {
+            videoDownloadSlots.withPermit {
+                runDownloadJob(video, quality, preferredAudioLanguage, resume)
+            }
+        }
+        downloadJobs[video.videoId] = job
+        // Only clear this exact job; a retry may already have replaced the map entry.
+        job.invokeOnCompletion { downloadJobs.remove(video.videoId, job) }
+    }
+
+    private suspend fun runDownloadJob(
+        video: FeedVideoItem,
+        quality: DownloadQuality,
+        preferredAudioLanguage: String,
+        resume: Boolean
+    ) {
+        val cancellation = DownloadCancellation().also { downloadCancellations[video.videoId] = it }
+        try {
+            val maxAttempts = if (resume) 2 else 1
+            var useResume = resume
+            var lastError: Throwable? = null
+            var attempt = 0
+
+            while (attempt < maxAttempts) {
+                try {
+                    downloadSingle(video, quality, preferredAudioLanguage, cancellation, useResume)
+                    finishDownloadSuccess(video)
+                    return
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    if (cancellation.isCancelled) throw CancellationException("Download cancelled", t)
+                    lastError = t
+                    attempt++
+                    if (attempt < maxAttempts) {
+                        val lastProgress = _activeDownloads.value[video.videoId]?.progress ?: 0f
+                        updateProgress(
+                            video,
+                            quality.label,
+                            lastProgress,
+                            "Resume failed, restarting..."
+                        )
+                        clearTempArtifacts(video.videoId)
+                        useResume = false
+                    }
                 }
             }
-            downloadJobs[video.videoId] = job
-            job.invokeOnCompletion {
-                downloadJobs.remove(video.videoId)
-            }
+            markDownloadFailed(video, quality, preferredAudioLanguage, lastError)
+        } finally {
+            // A retry may have installed a newer cancellation; do not remove that one.
+            downloadCancellations.remove(video.videoId, cancellation)
+        }
+    }
+
+    private fun finishDownloadSuccess(video: FeedVideoItem) {
+        failedDownloads.remove(video.videoId)
+        _activeDownloads.update { it - video.videoId }
+        clearTempArtifacts(video.videoId)
+    }
+
+    private fun markDownloadFailed(
+        video: FeedVideoItem,
+        quality: DownloadQuality,
+        preferredAudioLanguage: String,
+        error: Throwable?
+    ) {
+        val excName = error?.javaClass?.simpleName ?: "Error"
+        val topTrace = error?.stackTrace?.firstOrNull()?.let { "${it.className.substringAfterLast('.')}.${it.methodName}(:${it.lineNumber})" }
+        val excMsg = error?.message?.takeIf { !it.isBlank() }
+            ?: error?.cause?.message?.takeIf { !it.isBlank() }
+            ?: topTrace
+            ?: error?.toString()
+            ?: "Download error"
+        val fullReason = "$excName: $excMsg"
+        Log.e("FrontPorchDownload", "Download failed for ${video.videoId} (${video.title}): $fullReason", error)
+        failedDownloads[video.videoId] = PendingDownload(video, quality, preferredAudioLanguage)
+        _activeDownloads.update { current ->
+            val updated = current[video.videoId]?.copy(
+                isFailed = true,
+                statusText = "Failed: $fullReason"
+            ) ?: ActiveDownloadItem(
+                videoId = video.videoId,
+                title = video.title,
+                channelName = video.channelName,
+                qualityLabel = quality.label,
+                progress = 0f,
+                statusText = "Failed: $fullReason",
+                isFailed = true
+            )
+            current + (video.videoId to updated)
         }
     }
 
@@ -371,7 +639,8 @@ class VideoDownloadManager(
         video: FeedVideoItem,
         qualityLabel: String,
         progress: Float,
-        statusText: String
+        statusText: String,
+        isFailed: Boolean = false
     ) {
         _activeDownloads.update { current ->
             current + (
@@ -381,7 +650,8 @@ class VideoDownloadManager(
                     channelName = video.channelName,
                     qualityLabel = qualityLabel,
                     progress = progress.coerceIn(0f, 1f),
-                    statusText = statusText
+                    statusText = statusText,
+                    isFailed = isFailed
                 )
             )
         }
@@ -455,20 +725,20 @@ class VideoDownloadManager(
                 val channelName = info.uploaderName.orEmpty()
                 val targetHeight = quality.maxHeight
 
-                val audio = info.audioStreams
-                    .filter { it.format == NewPipeMediaFormat.M4A }
+                val aacAudio = info.audioStreams
+                    .filter { it.format == NewPipeMediaFormat.M4A || it.codec.orEmpty().startsWith("mp4a", ignoreCase = true) }
                     .filter { stream ->
                         val lang = stream.audioLocale?.language.orEmpty()
                         preferredAudioLanguage.isBlank() || preferredAudioLanguage == "auto" || lang.equals(preferredAudioLanguage, ignoreCase = true)
                     }
                     .maxByOrNull { it.averageBitrate }
                     ?: info.audioStreams
-                        .filter { it.format == NewPipeMediaFormat.M4A }
+                        .filter { it.format == NewPipeMediaFormat.M4A || it.codec.orEmpty().startsWith("mp4a", ignoreCase = true) }
                         .maxByOrNull { it.averageBitrate }
 
                 if (quality.audioOnly) {
-                    val audioUrl = audio?.url
-                    return@withContext audioUrl?.let {
+                    val targetAudio = aacAudio ?: info.audioStreams.maxByOrNull { it.averageBitrate }
+                    return@withContext targetAudio?.url?.let {
                         ResolvedQualityStreams(title, channelName, null, it, null, "", null)
                     }
                 }
@@ -491,10 +761,10 @@ class VideoDownloadManager(
                     )
                 }
 
-                // H.264/MP4 video-only stream plus a separate M4A track for higher qualities.
-                val video = info.videoOnlyStreams
+                // 1. Primary: H.264/AVC MP4 video-only stream plus AAC/M4A audio track
+                val avcVideo = info.videoOnlyStreams
                     .filter { it.format == NewPipeMediaFormat.MPEG_4 }
-                    .filter { it.codec.orEmpty().startsWith("avc", ignoreCase = true) }
+                    .filter { it.codec.isNullOrBlank() || it.codec.startsWith("avc", ignoreCase = true) }
                     .filter { it.height > 0 && it.height <= targetHeight }
                     .maxWithOrNull(
                         compareBy<org.schabi.newpipe.extractor.stream.VideoStream> { it.height }
@@ -503,14 +773,54 @@ class VideoDownloadManager(
                             .thenBy { it.bitrate }
                     )
 
-                if (video != null && audio != null) {
+                if (avcVideo != null && aacAudio != null) {
                     return@withContext ResolvedQualityStreams(
-                        title, channelName, video.url, audio.url, null, "", null
+                        title, channelName, avcVideo.url, aacAudio.url, null, "", null
+                    )
+                }
+
+                // 2. WebM Fallback: VP9/AV1 video + Opus audio (for WebM container output)
+                val opusAudio = info.audioStreams
+                    .filter { it.format == NewPipeMediaFormat.WEBMA || it.codec.orEmpty().contains("opus", ignoreCase = true) }
+                    .maxByOrNull { it.averageBitrate }
+
+                val webmVideo = info.videoOnlyStreams
+                    .filter { it.format == NewPipeMediaFormat.WEBMA || it.codec.orEmpty().contains("vp", ignoreCase = true) || it.codec.orEmpty().contains("av01", ignoreCase = true) }
+                    .filter { it.height > 0 && it.height <= targetHeight }
+                    .maxWithOrNull(
+                        compareBy<org.schabi.newpipe.extractor.stream.VideoStream> { it.height }
+                            .thenBy { if (quality.targetFps > 0) (if (it.fps >= quality.targetFps) 1 else 0) else it.fps }
+                            .thenBy { it.fps }
+                            .thenBy { it.bitrate }
+                    )
+
+                if (webmVideo != null && opusAudio != null) {
+                    return@withContext ResolvedQualityStreams(
+                        title, channelName, webmVideo.url, opusAudio.url, null, "", null
+                    )
+                }
+
+                // 3. Fallback: Any video stream + best available audio stream
+                val fallbackVideo = info.videoOnlyStreams
+                    .filter { it.height > 0 && it.height <= targetHeight }
+                    .maxWithOrNull(
+                        compareBy<org.schabi.newpipe.extractor.stream.VideoStream> { it.height }
+                            .thenBy { if (quality.targetFps > 0) (if (it.fps >= quality.targetFps) 1 else 0) else it.fps }
+                            .thenBy { it.fps }
+                            .thenBy { it.bitrate }
+                    )
+
+                val fallbackAudio = aacAudio ?: opusAudio ?: info.audioStreams.maxByOrNull { it.averageBitrate }
+
+                if (fallbackVideo != null && fallbackAudio != null) {
+                    return@withContext ResolvedQualityStreams(
+                        title, channelName, fallbackVideo.url, fallbackAudio.url, null, "", null
                     )
                 }
 
                 null
-            }.getOrElse {
+            }.getOrElse { err ->
+                Log.e("FrontPorchDownload", "NewPipe resolution failed for $videoId: ${err.message}", err)
                 null
             }
         } finally {
@@ -605,160 +915,167 @@ class VideoDownloadManager(
         )
     }
 
-    private suspend fun downloadSingle(video: FeedVideoItem, quality: DownloadQuality, preferredAudioLanguage: String = "en") {
-        val cancellation = DownloadCancellation().also { downloadCancellations[video.videoId] = it }
+    private suspend fun downloadSingle(
+        video: FeedVideoItem,
+        quality: DownloadQuality,
+        preferredAudioLanguage: String,
+        cancellation: DownloadCancellation,
+        resume: Boolean
+    ) {
         val rawVideoFile = File(tempWorkDir, "${video.videoId}_v.mp4")
         val rawAudioFile = File(tempWorkDir, "${video.videoId}_a.m4a")
         val tempMuxed = File(tempWorkDir, "${video.videoId}_out.mp4")
 
-        try {
-            cancellation.ensureActive()
-            updateProgress(video, quality.label, 0.04f, "Resolving stream...")
+        cancellation.ensureActive()
+        val startingProgress = if (resume) (_activeDownloads.value[video.videoId]?.progress ?: 0f) else 0.04f
+        updateProgress(
+            video,
+            quality.label,
+            startingProgress,
+            if (resume) "Resuming stream..." else "Resolving stream..."
+        )
 
-            // 1. Primary: NewPipeExtractor resolves direct, decipher-signed MP4 URLs.
-            var resolved = resolveViaNewPipe(video.videoId, quality, cancellation, preferredAudioLanguage)
-            cancellation.ensureActive()
+        // 1. Primary: NewPipeExtractor resolves direct, decipher-signed MP4 URLs.
+        var resolved = resolveViaNewPipe(video.videoId, quality, cancellation, preferredAudioLanguage)
+        cancellation.ensureActive()
 
-            if (resolved == null) {
-                // 2. Fallback: iOS HLS manifest
-                val hlsInfo = fetchIosHlsManifest(video.videoId, cancellation)
-                if (hlsInfo != null) {
-                    downloadFromHls(video, quality, hlsInfo, rawVideoFile, rawAudioFile, tempMuxed, cancellation)
-                    return
-                }
-
-                // 3. Last resort: extract ytInitialPlayerResponse + live PO token (pot) via mobile web session
-                updateProgress(video, quality.label, 0.04f, "Authorizing stream...")
-                resolved = resolveViaWebSession(video.videoId, quality, cancellation)
-                cancellation.ensureActive()
-            }
-
-            val resolvedStreams = resolved
-                ?: throw IllegalStateException("Could not authorize video stream")
-
-            val displayTitle = resolvedStreams.title.ifBlank { video.title }
-            val displayChannel = resolvedStreams.channelName.ifBlank { video.channelName }
-
-            if (quality.audioOnly) {
-                val targetAudio = resolvedStreams.audioUrl ?: resolvedStreams.muxedUrl
-                    ?: throw IllegalStateException("No audio stream available")
-                downloadDirectStream(targetAudio, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawAudioFile, cancellation) { p, speed ->
-                    updateProgress(video, quality.label, 0.08f + p * 0.85f, "Audio ${(p * 100).toInt()}% · ${formatSpeed(speed)}")
-                }
-                cancellation.ensureActive()
-                validateMediaFile(rawAudioFile, audioOnly = true)
-                val saved = saveToChosenFolder(rawAudioFile, sanitizeFileName(displayTitle), "m4a", "audio/mp4")
-                dao.upsert(
-                    DownloadedVideoEntity(
-                        videoId = video.videoId,
-                        title = displayTitle,
-                        channelName = displayChannel,
-                        localVideoPath = saved.uri,
-                        localThumbnailPath = null,
-                        fileSizeBytes = saved.sizeBytes,
-                        durationSeconds = video.durationSeconds,
-                        isShort = video.isShort
-                    )
-                )
+        if (resolved == null) {
+            // 2. Fallback: iOS HLS manifest
+            val hlsInfo = fetchIosHlsManifest(video.videoId, cancellation)
+            if (hlsInfo != null) {
+                downloadFromHls(video, quality, hlsInfo, rawVideoFile, rawAudioFile, tempMuxed, cancellation, resume)
                 return
             }
 
-            val adaptiveVideoUrl = resolvedStreams.videoUrl
-            val adaptiveAudioUrl = resolvedStreams.audioUrl
-            val finalTempFile: File = if (adaptiveVideoUrl != null && adaptiveAudioUrl != null) {
-                // 1080p+ has no muxed stream: video and audio are separate files. Download
-                // them concurrently instead of waiting for the whole video first.
-                val videoPct = AtomicInteger(0)
-                val audioPct = AtomicInteger(0)
-                fun reportCombined(speed: Long) {
-                    val fraction = (videoPct.get() + audioPct.get()) / 200f
-                    updateProgress(
-                        video, quality.label,
-                        0.08f + fraction * 0.60f,
-                        "Video + Audio ${(fraction * 100).toInt()}% · ${formatSpeed(speed)}"
-                    )
-                }
-                val autoSkipCategories = SponsorBlockPreferences.categoryBehaviors.value
-                    .filterValues { it == SponsorSkipBehavior.AUTO_SKIP }
-                    .keys
-                    .filter { it != SponsorCategory.POI_HIGHLIGHT }
-                    .map { it.apiKey }
+            // 3. Last resort: extract ytInitialPlayerResponse + live PO token (pot) via mobile web session
+            updateProgress(video, quality.label, startingProgress, "Authorizing stream...")
+            resolved = resolveViaWebSession(video.videoId, quality, cancellation)
+            cancellation.ensureActive()
+        }
 
-                val skipSegments = coroutineScope {
-                    val sponsorJob = async(Dispatchers.IO) {
-                        if (SponsorBlockPreferences.isEnabled.value && autoSkipCategories.isNotEmpty()) {
-                            runCatching {
-                                fetchSponsorBlockSegmentsUs(
-                                    videoId = video.videoId,
-                                    categories = autoSkipCategories,
-                                    cancellation = cancellation
-                                )
-                            }.getOrDefault(emptyList())
-                        } else {
-                            emptyList()
-                        }
-                    }
-                    val videoJob = async(Dispatchers.IO) {
-                        downloadDirectStream(adaptiveVideoUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawVideoFile, cancellation) { p, speed ->
-                            videoPct.set((p * 100).toInt())
-                            reportCombined(speed)
-                        }
-                    }
-                    val audioJob = async(Dispatchers.IO) {
-                        downloadDirectStream(adaptiveAudioUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, rawAudioFile, cancellation) { p, speed ->
-                            audioPct.set((p * 100).toInt())
-                            reportCombined(speed)
-                        }
-                    }
-                    awaitAll(videoJob, audioJob)
-                    sponsorJob.await()
-                }
-                updateProgress(video, quality.label, 0.88f, "Checking SponsorBlock...")
-                updateProgress(video, quality.label, 0.90f, "Muxing MP4...")
-                remuxTracksToMp4(rawVideoFile, rawAudioFile, tempMuxed, skipSegments, cancellation)
-                tempMuxed
-            } else if (resolvedStreams.muxedUrl != null) {
-                downloadDirectStream(resolvedStreams.muxedUrl, resolvedStreams.userAgent, resolvedStreams.cookieHeader, tempMuxed, cancellation) { p, speed ->
-                    updateProgress(video, quality.label, 0.08f + p * 0.84f, "Video ${(p * 100).toInt()}% · ${formatSpeed(speed)}")
-                }
-                tempMuxed
-            } else {
-                throw IllegalStateException("No playable stream for ${quality.label}")
+        val resolvedStreams = resolved
+            ?: throw IllegalStateException("Could not authorize video stream")
+
+        val displayTitle = resolvedStreams.title.ifBlank { video.title }
+        val displayChannel = resolvedStreams.channelName.ifBlank { video.channelName }
+
+        if (quality.audioOnly) {
+            val targetAudio = resolvedStreams.audioUrl ?: resolvedStreams.muxedUrl
+                ?: throw IllegalStateException("No audio stream available")
+            downloadDirectStream(
+                targetAudio,
+                resolvedStreams.userAgent,
+                resolvedStreams.cookieHeader,
+                rawAudioFile,
+                cancellation,
+                resume = resume
+            ) { p, speed ->
+                updateProgress(video, quality.label, 0.08f + p * 0.85f, "Audio ${(p * 100).toInt()}% · ${formatSpeed(speed)}")
             }
-
             cancellation.ensureActive()
-            validateMediaFile(finalTempFile)
-            updateProgress(video, quality.label, 0.95f, "Generating thumbnail...")
-            val thumbFile = extractFrameFromVideo(finalTempFile, video.videoId)
-            cancellation.ensureActive()
-            val saved = saveToChosenFolder(finalTempFile, sanitizeFileName(displayTitle), "mp4", "video/mp4")
-
+            validateMediaFile(rawAudioFile, audioOnly = true)
+            val saved = saveToChosenFolder(rawAudioFile, sanitizeFileName(displayTitle), "m4a", "audio/mp4")
             dao.upsert(
                 DownloadedVideoEntity(
                     videoId = video.videoId,
                     title = displayTitle,
                     channelName = displayChannel,
                     localVideoPath = saved.uri,
-                    localThumbnailPath = thumbFile?.absolutePath,
+                    localThumbnailPath = null,
                     fileSizeBytes = saved.sizeBytes,
                     durationSeconds = video.durationSeconds,
                     isShort = video.isShort
                 )
             )
-        } catch (t: CancellationException) {
-            throw t
-        } catch (t: Throwable) {
-            if (cancellation.isCancelled) throw CancellationException("Download cancelled")
-            updateProgress(video, quality.label, 0f, "Failed: ${t.message ?: "Download error"}")
-            delay(3000)
-        } finally {
-            downloadCancellations.remove(video.videoId)
-            rawVideoFile.delete()
-            rawAudioFile.delete()
-            tempMuxed.delete()
-            downloadJobs.remove(video.videoId)
-            _activeDownloads.update { it - video.videoId }
+            return
         }
+
+        val adaptiveVideoUrl = resolvedStreams.videoUrl
+        val adaptiveAudioUrl = resolvedStreams.audioUrl
+        var isWebmResult = false
+        val finalTempFile: File = if (adaptiveVideoUrl != null && adaptiveAudioUrl != null) {
+            // 1080p+ has no muxed stream: video and audio are separate files. Download
+            // them concurrently instead of waiting for the whole video first.
+            val videoPct = AtomicInteger(0)
+            val audioPct = AtomicInteger(0)
+            fun reportCombined(speed: Long) {
+                val fraction = (videoPct.get() + audioPct.get()) / 200f
+                updateProgress(
+                    video, quality.label,
+                    0.08f + fraction * 0.60f,
+                    "Video + Audio ${(fraction * 100).toInt()}% · ${formatSpeed(speed)}"
+                )
+            }
+            coroutineScope {
+                val videoJob = async(Dispatchers.IO) {
+                    downloadDirectStream(
+                        adaptiveVideoUrl,
+                        resolvedStreams.userAgent,
+                        resolvedStreams.cookieHeader,
+                        rawVideoFile,
+                        cancellation,
+                        resume = resume
+                    ) { p, speed ->
+                        videoPct.set((p * 100).toInt())
+                        reportCombined(speed)
+                    }
+                }
+                val audioJob = async(Dispatchers.IO) {
+                    downloadDirectStream(
+                        adaptiveAudioUrl,
+                        resolvedStreams.userAgent,
+                        resolvedStreams.cookieHeader,
+                        rawAudioFile,
+                        cancellation,
+                        resume = resume
+                    ) { p, speed ->
+                        audioPct.set((p * 100).toInt())
+                        reportCombined(speed)
+                    }
+                }
+                awaitAll(videoJob, audioJob)
+            }
+            updateProgress(video, quality.label, 0.90f, "Muxing media...")
+            val outputFormat = remuxTracksToMp4(rawVideoFile, rawAudioFile, tempMuxed, cancellation)
+            isWebmResult = outputFormat == MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+            tempMuxed
+        } else if (resolvedStreams.muxedUrl != null) {
+            downloadDirectStream(
+                resolvedStreams.muxedUrl,
+                resolvedStreams.userAgent,
+                resolvedStreams.cookieHeader,
+                tempMuxed,
+                cancellation,
+                resume = resume
+            ) { p, speed ->
+                updateProgress(video, quality.label, 0.08f + p * 0.84f, "Video ${(p * 100).toInt()}% · ${formatSpeed(speed)}")
+            }
+            tempMuxed
+        } else {
+            throw IllegalStateException("No playable stream for ${quality.label}")
+        }
+
+        cancellation.ensureActive()
+        validateMediaFile(finalTempFile)
+        updateProgress(video, quality.label, 0.95f, "Generating thumbnail...")
+        val thumbFile = extractFrameFromVideo(finalTempFile, video.videoId)
+        cancellation.ensureActive()
+        val ext = if (isWebmResult) "webm" else "mp4"
+        val mime = if (isWebmResult) "video/webm" else "video/mp4"
+        val saved = saveToChosenFolder(finalTempFile, sanitizeFileName(displayTitle), ext, mime)
+
+        dao.upsert(
+            DownloadedVideoEntity(
+                videoId = video.videoId,
+                title = displayTitle,
+                channelName = displayChannel,
+                localVideoPath = saved.uri,
+                localThumbnailPath = thumbFile?.absolutePath,
+                fileSizeBytes = saved.sizeBytes,
+                durationSeconds = video.durationSeconds,
+                isShort = video.isShort
+            )
+        )
     }
 
     private suspend fun downloadFromHls(
@@ -768,7 +1085,8 @@ class VideoDownloadManager(
         rawVideoStream: File,
         rawAudioStream: File,
         tempMuxed: File,
-        cancellation: DownloadCancellation
+        cancellation: DownloadCancellation,
+        resume: Boolean
     ) {
         val displayTitle = hlsInfo.title.ifBlank { video.title }
         val displayChannel = hlsInfo.channelName.ifBlank { video.channelName }
@@ -780,7 +1098,7 @@ class VideoDownloadManager(
         if (quality.audioOnly) {
             val targetAudioUrl = audioPlaylistUrl ?: videoPlaylistUrl
                 ?: throw IllegalStateException("No audio playlist in manifest")
-            downloadHlsSegments(targetAudioUrl, rawAudioStream, cancellation) { p ->
+            downloadHlsSegments(targetAudioUrl, rawAudioStream, cancellation, resume = resume) { p ->
                 updateProgress(video, quality.label, 0.05f + p * 0.85f, "Downloading audio ${(p * 100).toInt()}%")
             }
             updateProgress(video, quality.label, 0.93f, "Finalizing M4A...")
@@ -806,41 +1124,22 @@ class VideoDownloadManager(
         val targetVideoUrl = videoPlaylistUrl
             ?: throw IllegalStateException("No matching ${quality.label} stream")
 
-        downloadHlsSegments(targetVideoUrl, rawVideoStream, cancellation) { p ->
+        downloadHlsSegments(targetVideoUrl, rawVideoStream, cancellation, resume = resume) { p ->
             val weight = if (audioPlaylistUrl != null) 0.65f else 0.85f
             updateProgress(video, quality.label, 0.05f + p * weight, "Downloading video ${(p * 100).toInt()}%")
         }
 
         if (audioPlaylistUrl != null) {
-            downloadHlsSegments(audioPlaylistUrl, rawAudioStream, cancellation) { p ->
+            downloadHlsSegments(audioPlaylistUrl, rawAudioStream, cancellation, resume = resume) { p ->
                 updateProgress(video, quality.label, 0.70f + p * 0.18f, "Downloading audio ${(p * 100).toInt()}%")
             }
         }
 
-        val autoSkipCategories = SponsorBlockPreferences.categoryBehaviors.value
-            .filterValues { it == SponsorSkipBehavior.AUTO_SKIP }
-            .keys
-            .filter { it != SponsorCategory.POI_HIGHLIGHT }
-            .map { it.apiKey }
-
-        val skipSegments = if (SponsorBlockPreferences.isEnabled.value && autoSkipCategories.isNotEmpty()) {
-            updateProgress(video, quality.label, 0.88f, "Checking SponsorBlock...")
-            runCatching {
-                fetchSponsorBlockSegmentsUs(
-                    videoId = video.videoId,
-                    categories = autoSkipCategories,
-                    cancellation = cancellation
-                )
-            }.getOrDefault(emptyList())
-        } else {
-            emptyList()
-        }
         updateProgress(video, quality.label, 0.90f, "Muxing MP4...")
         remuxTracksToMp4(
             videoRaw = rawVideoStream,
             audioRaw = rawAudioStream.takeIf { it.exists() && it.length() > 0L },
             outMp4 = tempMuxed,
-            skipSegments = skipSegments,
             cancellation = cancellation
         )
 
@@ -935,7 +1234,69 @@ class VideoDownloadManager(
                     if (cont.isActive) cont.resume(resolved) {}
                 }
 
+                fun parsePlayerJson(jsonStr: String) {
+                    runCatching {
+                        val root = JSONObject(jsonStr)
+                        val details = root.optJSONObject("videoDetails")
+                        if (details != null) {
+                            if (capturedTitle.isBlank()) capturedTitle = details.optString("title")
+                            if (capturedAuthor.isBlank()) capturedAuthor = details.optString("author")
+                        }
+
+                        val streaming = root.optJSONObject("streamingData")
+                        if (streaming != null) {
+                            val hls = streaming.optString("hlsManifestUrl")
+                            if (hls.isNotBlank() && capturedHlsUrl == null) capturedHlsUrl = hls
+
+                            val formats = streaming.optJSONArray("formats")
+                            if (formats != null && capturedMuxedUrl == null) {
+                                for (i in 0 until formats.length()) {
+                                    val fmt = formats.optJSONObject(i) ?: continue
+                                    val fUrl = fmt.optString("url")
+                                    val h = fmt.optInt("height", 0)
+                                    if (fUrl.isNotBlank() && h <= quality.maxHeight) {
+                                        capturedMuxedUrl = fUrl
+                                        break
+                                    }
+                                }
+                            }
+
+                            val adaptive = streaming.optJSONArray("adaptiveFormats")
+                            if (adaptive != null) {
+                                val bestVid = selectBestVideoFormat(adaptive, quality.maxHeight)
+                                if (bestVid != null && capturedVideoUrl == null) {
+                                    capturedVideoUrl = bestVid.url
+                                }
+                                if (capturedAudioUrl == null) {
+                                    for (i in 0 until adaptive.length()) {
+                                        val item = adaptive.optJSONObject(i) ?: continue
+                                        val mime = item.optString("mimeType")
+                                        val aUrl = item.optString("url")
+                                        if (mime.startsWith("audio/") && aUrl.isNotBlank()) {
+                                            capturedAudioUrl = aUrl
+                                            if (mime.startsWith("audio/mp4")) break
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        mainHandler.post { tryComplete() }
+                    }
+                }
+
                 webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        webView.evaluateJavascript("(function() { return JSON.stringify(window.ytInitialPlayerResponse || {}); })()") { jsRes ->
+                            if (!jsRes.isNullOrBlank() && jsRes != "{}" && jsRes != "null") {
+                                val unquoted = if (jsRes.startsWith("\"") && jsRes.endsWith("\"")) {
+                                    runCatching { org.json.JSONTokener(jsRes).nextValue().toString() }.getOrDefault(jsRes)
+                                } else jsRes
+                                parsePlayerJson(unquoted)
+                            }
+                        }
+                    }
+
                     override fun shouldInterceptRequest(
                         view: WebView?,
                         request: WebResourceRequest?
@@ -943,7 +1304,6 @@ class VideoDownloadManager(
                         val url = request?.url?.toString().orEmpty()
                         if (url.contains("/youtubei/v1/player")) {
                             runCatching {
-                                // Request intercepting happens off the main thread; read response body via OkHttp
                                 val reqHeaders = request?.requestHeaders.orEmpty()
                                 val okReq = Request.Builder()
                                     .url(url)
@@ -956,51 +1316,7 @@ class VideoDownloadManager(
 
                                 okHttpClient.newCall(okReq).execute().use { resp ->
                                     val jsonStr = resp.body?.string().orEmpty()
-                                    val root = JSONObject(jsonStr)
-                                    val details = root.optJSONObject("videoDetails")
-                                    if (details != null) {
-                                        if (capturedTitle.isBlank()) capturedTitle = details.optString("title")
-                                        if (capturedAuthor.isBlank()) capturedAuthor = details.optString("author")
-                                    }
-
-                                    val streaming = root.optJSONObject("streamingData")
-                                    if (streaming != null) {
-                                        val hls = streaming.optString("hlsManifestUrl")
-                                        if (hls.isNotBlank() && capturedHlsUrl == null) capturedHlsUrl = hls
-
-                                        val formats = streaming.optJSONArray("formats")
-                                        if (formats != null && capturedMuxedUrl == null) {
-                                            for (i in 0 until formats.length()) {
-                                                val fmt = formats.optJSONObject(i) ?: continue
-                                                val fUrl = fmt.optString("url")
-                                                val h = fmt.optInt("height", 0)
-                                                if (fUrl.isNotBlank() && h <= quality.maxHeight) {
-                                                    capturedMuxedUrl = fUrl
-                                                    break
-                                                }
-                                            }
-                                        }
-
-                                        val adaptive = streaming.optJSONArray("adaptiveFormats")
-                                        if (adaptive != null) {
-                                            val bestVid = selectBestVideoFormat(adaptive, quality.maxHeight)
-                                            if (bestVid != null && capturedVideoUrl == null) {
-                                                capturedVideoUrl = bestVid.url
-                                            }
-                                            if (capturedAudioUrl == null) {
-                                                for (i in 0 until adaptive.length()) {
-                                                    val item = adaptive.optJSONObject(i) ?: continue
-                                                    val mime = item.optString("mimeType")
-                                                    val aUrl = item.optString("url")
-                                                    if (mime.startsWith("audio/mp4") && aUrl.isNotBlank()) {
-                                                        capturedAudioUrl = aUrl
-                                                        break
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    mainHandler.post { tryComplete() }
+                                    parsePlayerJson(jsonStr)
                                 }
                             }
                         }
@@ -1020,6 +1336,7 @@ class VideoDownloadManager(
         cookieHeader: String?,
         destination: File,
         cancellation: DownloadCancellation,
+        resume: Boolean,
         onProgress: (Float, Long) -> Unit
     ) = withContext(Dispatchers.IO) {
         fun requestFor(range: String? = null): Request {
@@ -1032,27 +1349,31 @@ class VideoDownloadManager(
 
         // A 1-byte range probe tells us whether the CDN supports ranged requests and the
         // real file size. Most YouTube media hosts do; when they don't we fall back to a
-        // single ordinary GET.
+        // single ordinary GET (which cannot be resumed safely).
         var totalBytes = -1L
         var rangeSupported = false
         okHttpClient.newCall(requestFor("bytes=0-0")).executeCancellable(cancellation).use { probe ->
             val contentRange = probe.header("Content-Range")
+            val contentLength = probe.header("Content-Length")?.toLongOrNull() ?: -1L
             if (probe.code == 206 && contentRange != null) {
                 totalBytes = contentRange.substringAfterLast('/').trim().toLongOrNull() ?: -1L
                 rangeSupported = totalBytes > 0L
+            } else if (probe.code == 200 && contentLength > 0L) {
+                totalBytes = contentLength
+                rangeSupported = false
             }
         }
         cancellation.ensureActive()
 
-        if (!rangeSupported || totalBytes < 4L * 1024 * 1024) {
-            // Single stream for small files or hosts that ignore Range. Progress is still
-            // throttled so the UI/notification are not flooded.
+        val identity = streamIdentity(url)
+
+        if (!rangeSupported || totalBytes <= 0L) {
+            deletePartState(destination)
+            if (destination.exists()) destination.delete()
             okHttpClient.newCall(requestFor()).executeCancellable(cancellation).use { response ->
-                if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code} downloading stream")
-                val body = response.body ?: throw IllegalStateException("Empty response body")
-                val expected = body.contentLength().takeIf { it > 0L }
-                    ?: totalBytes.takeIf { it > 0L }
-                    ?: 10_000_000L
+                if (!response.isSuccessful) throw IllegalStateException("[ChunkDownload] HTTP ${response.code} downloading stream")
+                val body = response.body ?: throw IllegalStateException("[ChunkDownload] Empty response body")
+                val expected = body.contentLength().takeIf { it > 0L } ?: 10_000_000L
                 val progress = ThrottledProgress(onReport = onProgress)
                 var downloaded = 0L
                 body.byteStream().use { input ->
@@ -1072,25 +1393,97 @@ class VideoDownloadManager(
             return@withContext
         }
 
+        if (totalBytes < 4L * 1024 * 1024) {
+            // Small files use one request, but can still resume from the last verified byte.
+            val prior = if (resume) readPartState(destination) as? DownloadPartState.Direct else null
+            val matches = prior != null && prior.identity == identity && prior.totalBytes == totalBytes && prior.chunkCount == 1
+            val completedBefore = prior?.completedChunks.orEmpty()
+            if (matches && completedBefore.contains(0) && destination.exists() && destination.length() == totalBytes) {
+                onProgress(1f, totalBytes)
+                return@withContext
+            }
+
+            val canResume = matches && !completedBefore.contains(0) &&
+                destination.exists() && destination.length() in 1 until totalBytes
+            val startAt = if (canResume) destination.length() else 0L
+            if (!canResume) {
+                deletePartState(destination)
+                destination.delete()
+                destination.parentFile?.mkdirs()
+                writePartState(destination, DownloadPartState.Direct(identity, totalBytes, 1L, 1, emptySet()))
+            }
+
+            val range = if (startAt > 0L) "bytes=$startAt-${totalBytes - 1}" else null
+            okHttpClient.newCall(requestFor(range)).executeCancellable(cancellation).use { response ->
+                if (range != null && response.code != 206) {
+                    throw IllegalStateException("Server ignored resume range")
+                }
+                if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code} downloading stream")
+                val body = response.body ?: throw IllegalStateException("Empty response body")
+                val progress = ThrottledProgress(initialBytes = startAt, onReport = onProgress)
+                var downloaded = startAt
+                body.byteStream().use { input ->
+                    FileOutputStream(destination, startAt > 0L).use { output ->
+                        val buffer = ByteArray(256 * 1024)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            cancellation.ensureActive()
+                            output.write(buffer, 0, read)
+                            downloaded += read.toLong()
+                            progress.report(downloaded.toFloat() / totalBytes, downloaded)
+                        }
+                    }
+                }
+                if (downloaded != totalBytes) {
+                    throw IllegalStateException("Incomplete stream: $downloaded/$totalBytes bytes")
+                }
+                writePartState(destination, DownloadPartState.Direct(identity, totalBytes, 1L, 1, setOf(0)))
+                progress.finish(downloaded)
+            }
+            return@withContext
+        }
+
         // Parallel ranged chunks. Each coroutine writes to its own disjoint offset of the
-        // same file via RandomAccessFile, so no merge pass is needed.
+        // same file via RandomAccessFile, so no merge pass is needed. Completed chunk indexes
+        // live in a sidecar file so a retry can skip them instead of re-downloading everything.
         val chunkCount = when {
             totalBytes >= 64L * 1024 * 1024 -> 12
             totalBytes >= 16L * 1024 * 1024 -> 8
             else -> 4
         }.coerceAtLeast(2)
         val chunkSize = totalBytes / chunkCount
-        val progress = ThrottledProgress(onReport = onProgress)
-        val downloaded = AtomicLong(0L)
 
-        destination.parentFile?.mkdirs()
-        RandomAccessFile(destination, "rw").use { it.setLength(totalBytes) }
+        fun chunkEnd(index: Int): Long =
+            if (index == chunkCount - 1) totalBytes - 1 else (index + 1) * chunkSize - 1L
+        fun chunkLength(index: Int): Long = chunkEnd(index) - index * chunkSize + 1L
+
+        val completedChunks = ConcurrentHashMap.newKeySet<Int>()
+        val prior = if (resume) readPartState(destination) as? DownloadPartState.Direct else null
+        val canResume = prior != null && prior.identity == identity && prior.totalBytes == totalBytes &&
+            prior.chunkCount == chunkCount && prior.chunkSize == chunkSize &&
+            destination.exists() && destination.length() == totalBytes
+
+        var initialBytes = 0L
+        if (canResume) {
+            prior?.completedChunks.orEmpty().filter { it in 0 until chunkCount }.forEach { index ->
+                if (completedChunks.add(index)) initialBytes += chunkLength(index)
+            }
+        } else {
+            deletePartState(destination)
+            destination.parentFile?.mkdirs()
+            RandomAccessFile(destination, "rw").use { it.setLength(totalBytes) }
+            writePartState(destination, DownloadPartState.Direct(identity, totalBytes, chunkSize, chunkCount, emptySet()))
+        }
+
+        val progress = ThrottledProgress(initialBytes = initialBytes, onReport = onProgress)
+        val downloaded = AtomicLong(initialBytes)
+        onProgress(initialBytes.toFloat() / totalBytes, 0L)
 
         coroutineScope {
-            (0 until chunkCount).map { index ->
+            (0 until chunkCount).filterNot(completedChunks::contains).map { index ->
                 async(Dispatchers.IO) {
                     val start = index * chunkSize
-                    val end = if (index == chunkCount - 1) totalBytes - 1 else start + chunkSize - 1
+                    val end = chunkEnd(index)
                     var attempt = 0
                     var completed = false
                     var lastError: Exception? = null
@@ -1102,10 +1495,10 @@ class VideoDownloadManager(
                             okHttpClient.newCall(requestFor("bytes=$start-$end"))
                                 .executeCancellable(cancellation).use { response ->
                                     if (response.code != 206) {
-                                        throw IllegalStateException("HTTP ${response.code} for range $start-$end")
+                                        throw IllegalStateException("[ChunkDownload] HTTP ${response.code} for range $start-$end")
                                     }
                                     val body = response.body
-                                        ?: throw IllegalStateException("Empty response body for range $start-$end")
+                                        ?: throw IllegalStateException("[ChunkDownload] Empty response body for range $start-$end")
 
                                     RandomAccessFile(destination, "rw").use { file ->
                                         file.seek(start)
@@ -1121,11 +1514,16 @@ class VideoDownloadManager(
                                             }
                                             val expectedLen = end - start + 1L
                                             if (attemptWritten != expectedLen) {
-                                                throw IllegalStateException("Incomplete chunk $index: $attemptWritten/$expectedLen bytes")
+                                                throw IllegalStateException("[ChunkDownload] Incomplete chunk $index: $attemptWritten/$expectedLen bytes")
                                             }
                                         }
                                     }
                                 }
+                            completedChunks.add(index)
+                            writePartState(
+                                destination,
+                                DownloadPartState.Direct(identity, totalBytes, chunkSize, chunkCount, completedChunks.toSet())
+                            )
                             completed = true
                         } catch (e: Exception) {
                             if (e is CancellationException) throw e
@@ -1137,10 +1535,11 @@ class VideoDownloadManager(
                             }
                         }
                     }
-                    if (!completed) throw (lastError ?: IllegalStateException("Chunk $index failed"))
+                    if (!completed) throw (lastError ?: IllegalStateException("[ChunkDownload] Chunk $index failed"))
                 }
             }.awaitAll()
         }
+        writePartState(destination, DownloadPartState.Direct(identity, totalBytes, chunkSize, chunkCount, (0 until chunkCount).toSet()))
         progress.finish(downloaded.get())
     }
 
@@ -1207,6 +1606,7 @@ class VideoDownloadManager(
         playlistUrl: String,
         outputFile: File,
         cancellation: DownloadCancellation,
+        resume: Boolean,
         onProgress: (Float) -> Unit
     ) = withContext(Dispatchers.IO) {
         val playlistText = httpGetText(playlistUrl, cancellation)
@@ -1222,96 +1622,149 @@ class VideoDownloadManager(
 
         if (segmentUrls.isEmpty()) {
             // Might be a master manifest or direct media playlist; treat as single file if needed
-            downloadDirectStream(playlistUrl, iosUserAgent, null, outputFile, cancellation) { p, _ -> onProgress(p) }
+            deletePartState(outputFile)
+            downloadDirectStream(
+                playlistUrl,
+                iosUserAgent,
+                null,
+                outputFile,
+                cancellation,
+                resume = resume
+            ) { p, _ -> onProgress(p) }
             return@withContext
         }
 
-        FileOutputStream(outputFile).use { out ->
-            segmentUrls.forEachIndexed { index, segUrl ->
-                cancellation.ensureActive()
-                var attempt = 0
-                var written = false
-                var lastError: Exception? = null
-                while (attempt < 3 && !written) {
-                    attempt++
-                    try {
-                        val req = Request.Builder()
-                            .url(segUrl)
-                            .header("User-Agent", iosUserAgent)
-                            .get()
-                            .build()
+        val identity = listOf(
+            streamIdentity(playlistUrl),
+            segmentUrls.size.toString(),
+            streamIdentity(segmentUrls.last())
+        ).joinToString("#").replace("|", "%7C")
 
-                        okHttpClient.newCall(req).executeCancellable(cancellation).use { resp ->
-                            if (!resp.isSuccessful) {
-                                throw IllegalStateException("HTTP ${resp.code} fetching HLS segment ${index + 1}/${segmentUrls.size}")
-                            }
-                            val body = resp.body
-                                ?: throw IllegalStateException("Empty HLS segment ${index + 1}/${segmentUrls.size}")
-                            body.byteStream().use { input -> input.copyTo(out, 256 * 1024) }
+        val prior = if (resume) readPartState(outputFile) as? DownloadPartState.Hls else null
+        val canResume = prior != null && prior.identity == identity &&
+            prior.segmentCount == segmentUrls.size &&
+            prior.completedSegments in 0..segmentUrls.size &&
+            prior.completedBytes >= 0L &&
+            outputFile.exists() && outputFile.length() >= prior.completedBytes
+
+        var completed = 0
+        var completedBytes = 0L
+        if (canResume) {
+            completed = prior?.completedSegments ?: 0
+            completedBytes = prior?.completedBytes ?: 0L
+            // Drop bytes from a segment that was interrupted mid-write.
+            RandomAccessFile(outputFile, "rw").use { it.setLength(completedBytes) }
+        } else {
+            deletePartState(outputFile)
+            outputFile.delete()
+            outputFile.parentFile?.mkdirs()
+            writePartState(outputFile, DownloadPartState.Hls(identity, segmentUrls.size, 0, 0L))
+        }
+        onProgress(completed.toFloat() / segmentUrls.size.toFloat())
+
+        for (index in completed until segmentUrls.size) {
+            val segUrl = segmentUrls[index]
+            cancellation.ensureActive()
+            var written = false
+            var lastError: Exception? = null
+            var attempt = 0
+            while (attempt < 3 && !written) {
+                attempt++
+                try {
+                    // Rewind to the last fully written segment before each attempt.
+                    RandomAccessFile(outputFile, "rw").use { it.setLength(completedBytes) }
+
+                    val req = Request.Builder()
+                        .url(segUrl)
+                        .header("User-Agent", iosUserAgent)
+                        .get()
+                        .build()
+
+                    okHttpClient.newCall(req).executeCancellable(cancellation).use { resp ->
+                        if (!resp.isSuccessful) {
+                            throw IllegalStateException("HTTP ${resp.code} fetching HLS segment ${index + 1}/${segmentUrls.size}")
                         }
-                        written = true
-                    } catch (e: Exception) {
-                        if (e is CancellationException) throw e
-                        cancellation.ensureActive()
-                        lastError = e
-                        if (attempt < 3) delay(250L * attempt)
+                        val body = resp.body
+                            ?: throw IllegalStateException("Empty HLS segment ${index + 1}/${segmentUrls.size}")
+
+                        var segmentBytes = 0L
+                        FileOutputStream(outputFile, true).use { out ->
+                            body.byteStream().use { input ->
+                                val buffer = ByteArray(256 * 1024)
+                                var read: Int
+                                while (input.read(buffer).also { read = it } != -1) {
+                                    cancellation.ensureActive()
+                                    out.write(buffer, 0, read)
+                                    segmentBytes += read.toLong()
+                                }
+                            }
+                        }
+                        completedBytes += segmentBytes
                     }
+                    writePartState(
+                        outputFile,
+                        DownloadPartState.Hls(identity, segmentUrls.size, index + 1, completedBytes)
+                    )
+                    written = true
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    cancellation.ensureActive()
+                    lastError = e
+                    if (attempt < 3) delay(250L * attempt)
                 }
-                if (!written) {
-                    throw lastError ?: IllegalStateException("Failed HLS segment ${index + 1}/${segmentUrls.size}")
-                }
-                onProgress((index + 1).toFloat() / segmentUrls.size.toFloat())
             }
+            if (!written) {
+                throw lastError ?: IllegalStateException("Failed HLS segment ${index + 1}/${segmentUrls.size}")
+            }
+            onProgress((index + 1).toFloat() / segmentUrls.size.toFloat())
         }
     }
 
-    private suspend fun fetchSponsorBlockSegmentsUs(
-        videoId: String,
-        categories: List<String>,
-        cancellation: DownloadCancellation
-    ): List<SponsorSegment> = withContext(Dispatchers.IO) {
-        val catJson = JSONArray(categories).toString()
-        val encoded = URLEncoder.encode(catJson, "UTF-8")
-        val url = "https://sponsor.ajay.app/api/skipSegments?videoID=$videoId&categories=$encoded"
-
-        val req = Request.Builder().url(url).get().build()
-        runCatching {
-            okHttpClient.newCall(req).executeCancellable(cancellation).use { resp ->
-                if (!resp.isSuccessful) return@withContext emptyList()
-                val arr = JSONArray(resp.body?.string().orEmpty())
-                val list = mutableListOf<SponsorSegment>()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    val cat = SponsorCategory.fromApiKey(obj.optString("category")) ?: continue
-                    val times = obj.optJSONArray("segment") ?: continue
-                    if (times.length() < 2) continue
-                    val start = times.optDouble(0, 0.0).toFloat()
-                    val end = times.optDouble(1, 0.0).toFloat()
-                    if (end > start + 0.3f) {
-                        list.add(SponsorSegment(obj.optString("UUID"), start, end, cat))
-                    }
-                }
-                list.sortedBy { it.startSec }
-            }
-        }.getOrDefault(emptyList())
-    }
-
+    @OptIn(UnstableApi::class)
     private suspend fun remuxTracksToMp4(
         videoRaw: File?,
         audioRaw: File?,
         outMp4: File,
-        skipSegments: List<SponsorSegment> = emptyList(),
         cancellation: DownloadCancellation
-    ) = withContext(Dispatchers.IO) {
+    ): Int = withContext(Dispatchers.IO) {
         cancellation.ensureActive()
-        val muxer = MediaMuxer(outMp4.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        // A previous attempt may have left a partially muxed output behind.
+        outMp4.delete()
+
         val extractorVideo = if (videoRaw != null && videoRaw.exists()) MediaExtractor().apply { setDataSource(videoRaw.absolutePath) } else null
         val extractorAudio = if (audioRaw != null && audioRaw.exists()) MediaExtractor().apply { setDataSource(audioRaw.absolutePath) } else null
+
+        val videoMime = extractorVideo?.let { ext ->
+            (0 until ext.trackCount).mapNotNull {
+                runCatching { ext.getTrackFormat(it).getString(MediaFormat.KEY_MIME) }.getOrNull()
+            }.find { it.startsWith("video/") }
+        }.orEmpty()
+
+        val audioMime = extractorAudio?.let { ext ->
+            (0 until ext.trackCount).mapNotNull {
+                runCatching { ext.getTrackFormat(it).getString(MediaFormat.KEY_MIME) }.getOrNull()
+            }.find { it.startsWith("audio/") }
+        }.orEmpty()
+
+        val isWebm = videoMime.contains("vp9", ignoreCase = true) ||
+                videoMime.contains("vp8", ignoreCase = true) ||
+                audioMime.contains("opus", ignoreCase = true) ||
+                audioMime.contains("vorbis", ignoreCase = true)
+
+        val outputFormat = if (isWebm) MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM else MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+
+        var muxerStarted = false
+        var muxerClosed = false
+        val muxer: DownloadMuxerWrapper = if (isWebm) {
+            PlatformMuxerWrapper(MediaMuxer(outMp4.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM))
+        } else {
+            Media3MuxerWrapper(MediaMuxerCompat(outMp4.absolutePath, MediaMuxerCompat.OUTPUT_FORMAT_MP4))
+        }
 
         try {
             var videoTrackIndex = -1
             var audioTrackIndex = -1
-            val buffer = ByteBuffer.allocate(256 * 1024)
+            val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
             val info = MediaCodec.BufferInfo()
 
             extractorVideo?.let { ext ->
@@ -1336,18 +1789,18 @@ class VideoDownloadManager(
                 }
             }
 
+            if (videoTrackIndex == -1 && audioTrackIndex == -1) {
+                throw IllegalStateException("No video or audio tracks found in downloaded streams")
+            }
+
             muxer.start()
+            muxerStarted = true
 
-            // Mux video samples with SponsorBlock segment trimming
+            // Mux video samples
             if (extractorVideo != null && videoTrackIndex >= 0) {
-                // Samples arrive in chronological order, so a single cursor replaces the
-                // old per-sample filter/sumOf scan over every skip segment.
-                val sortedSkips = skipSegments.sortedBy { it.startSec }
-                var skipCursor = 0
-                var cumulativeTrimUs = 0L
-
                 while (true) {
                     cancellation.ensureActive()
+                    buffer.clear()
                     info.offset = 0
                     info.size = extractorVideo.readSampleData(buffer, 0)
                     if (info.size < 0) break
@@ -1360,21 +1813,8 @@ class VideoDownloadManager(
                         0
                     }
 
-                    val currentSec = info.presentationTimeUs / 1_000_000f
-                    while (skipCursor < sortedSkips.size && sortedSkips[skipCursor].endSec <= currentSec) {
-                        cumulativeTrimUs += ((sortedSkips[skipCursor].endSec - sortedSkips[skipCursor].startSec) * 1_000_000f).toLong()
-                        skipCursor++
-                    }
-                    if (sortedSkips.getOrNull(skipCursor)?.let { currentSec >= it.startSec && currentSec < it.endSec } == true) {
-                        // Skip this sample; advance extractor
-                        extractorVideo.advance()
-                        continue
-                    }
-
-                    // Adjust timestamps if segments were removed. Do not force monotonic PTS
-                    // on video: H.264 B-frames have out-of-order presentation times and clamping
-                    // them causes jitter.
-                    info.presentationTimeUs = (info.presentationTimeUs - cumulativeTrimUs).coerceAtLeast(0L)
+                    buffer.position(info.offset)
+                    buffer.limit(info.offset + info.size)
 
                     muxer.writeSampleData(videoTrackIndex, buffer, info)
                     extractorVideo.advance()
@@ -1383,12 +1823,9 @@ class VideoDownloadManager(
 
             // Mux audio samples
             if (extractorAudio != null && audioTrackIndex >= 0) {
-                var outputAudioTimeUs = 0L
-                val sortedSkips = skipSegments.sortedBy { it.startSec }
-                var skipCursor = 0
-                var cumulativeTrimUs = 0L
                 while (true) {
                     cancellation.ensureActive()
+                    buffer.clear()
                     info.offset = 0
                     info.size = extractorAudio.readSampleData(buffer, 0)
                     if (info.size < 0) break
@@ -1401,31 +1838,32 @@ class VideoDownloadManager(
                         0
                     }
 
-                    val currentSec = info.presentationTimeUs / 1_000_000f
-                    while (skipCursor < sortedSkips.size && sortedSkips[skipCursor].endSec <= currentSec) {
-                        cumulativeTrimUs += ((sortedSkips[skipCursor].endSec - sortedSkips[skipCursor].startSec) * 1_000_000f).toLong()
-                        skipCursor++
-                    }
-                    if (sortedSkips.getOrNull(skipCursor)?.let { currentSec >= it.startSec && currentSec < it.endSec } == true) {
-                        extractorAudio.advance()
-                        continue
-                    }
-
-                    info.presentationTimeUs = (info.presentationTimeUs - cumulativeTrimUs).coerceAtLeast(outputAudioTimeUs)
-                    outputAudioTimeUs = info.presentationTimeUs
+                    buffer.position(info.offset)
+                    buffer.limit(info.offset + info.size)
 
                     muxer.writeSampleData(audioTrackIndex, buffer, info)
                     extractorAudio.advance()
                 }
             }
 
+            muxer.stop()
+            muxerClosed = true
+            outputFormat
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            val topTrace = e.stackTrace.firstOrNull()?.let { "${it.className.substringAfterLast('.')}.${it.methodName}(:${it.lineNumber})" }
+            val msg = e.message?.takeIf { !it.isBlank() } ?: e.cause?.message?.takeIf { !it.isBlank() } ?: topTrace ?: e.toString()
+            val errorDetails = "[Muxing] Failed: ${e.javaClass.simpleName} - $msg"
+            Log.e("FrontPorchDownload", errorDetails, e)
+            outMp4.delete()
+            videoRaw?.delete()
+            audioRaw?.delete()
+            throw IllegalStateException(errorDetails, e)
         } finally {
             runCatching { extractorVideo?.release() }
             runCatching { extractorAudio?.release() }
-            runCatching {
-                muxer.stop()
-                muxer.release()
-            }
+            runCatching { if (muxerStarted && !muxerClosed) muxer.stop() }
+            runCatching { muxer.release() }
         }
     }
 
@@ -1453,22 +1891,77 @@ class VideoDownloadManager(
         val customUri = settingsStore.getCustomFolderUri()
 
         if (customUri != null) {
-            val docDir = DocumentFile.fromTreeUri(context, customUri)
-            if (docDir != null && docDir.canWrite()) {
-                val newDoc = docDir.createFile(mimeType, targetName)
-                if (newDoc != null) {
-                    context.contentResolver.openOutputStream(newDoc.uri)?.use { out ->
-                        // SAF writes are another full-file copy; the default 8 KB buffer
-                        // makes this needlessly chatty on a large MP4.
-                        sourceFile.inputStream().use { it.copyTo(out, bufferSize = 256 * 1024) }
+            runCatching {
+                val docDir = DocumentFile.fromTreeUri(context, customUri)
+                if (docDir != null && docDir.canWrite()) {
+                    docDir.findFile(targetName)?.delete()
+                    val newDoc = docDir.createFile(mimeType, targetName)
+                    if (newDoc != null) {
+                        val pfd = context.contentResolver.openFileDescriptor(newDoc.uri, "rwt")
+                        if (pfd != null) {
+                            pfd.use { descriptor ->
+                                FileOutputStream(descriptor.fileDescriptor).use { out ->
+                                    sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
+                                }
+                            }
+                        } else {
+                            context.contentResolver.openOutputStream(newDoc.uri)?.use { out ->
+                                sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
+                            }
+                        }
+                        return@withContext SavedFileResult(newDoc.uri.toString(), sourceFile.length())
                     }
-                    return@withContext SavedFileResult(newDoc.uri.toString(), sourceFile.length())
                 }
+            }.onFailure { e ->
+                Log.e("FrontPorchDownload", "SAF save failed for $targetName: ${e.message}", e)
             }
         }
 
-        // Fallback to standard Environment.DIRECTORY_DOWNLOADS/FrontPorch
-        val downloadsDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FrontPorch").apply { mkdirs() }
+        // Save via MediaStore (supports Android 10+ Scoped Storage without permission errors)
+        runCatching {
+            val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/FrontPorch"
+
+            val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+            val selectionArgs = arrayOf(targetName, "$relativePath%")
+            runCatching { context.contentResolver.delete(collection, selection, selectionArgs) }
+
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, targetName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+
+            val itemUri = context.contentResolver.insert(collection, values)
+            if (itemUri != null) {
+                val pfd = context.contentResolver.openFileDescriptor(itemUri, "rwt")
+                if (pfd != null) {
+                    pfd.use { descriptor ->
+                        FileOutputStream(descriptor.fileDescriptor).use { out ->
+                            sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
+                        }
+                    }
+                } else {
+                    context.contentResolver.openOutputStream(itemUri)?.use { out ->
+                        sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
+                    }
+                }
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                context.contentResolver.update(itemUri, values, null, null)
+                return@withContext SavedFileResult(itemUri.toString(), sourceFile.length())
+            }
+        }.onFailure { e ->
+            Log.e("FrontPorchDownload", "MediaStore save failed for $targetName: ${e.message}", e)
+        }
+
+        // Fallback: standard file I/O to public downloads or app-specific downloads
+        val downloadsDir = runCatching {
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FrontPorch").apply { mkdirs() }
+        }.getOrNull()?.takeIf { (it.exists() || it.mkdirs()) && it.canWrite() }
+            ?: File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir, "FrontPorch").apply { mkdirs() }
+
         val targetFile = File(downloadsDir, targetName)
         sourceFile.copyTo(targetFile, overwrite = true, bufferSize = 256 * 1024)
         SavedFileResult(targetFile.absolutePath, targetFile.length())
@@ -1533,4 +2026,31 @@ private class NewPipeOkHttpDownloader(
             if (cancellation != null) cancellation.unregister(call)
         }
     }
+}
+
+private interface DownloadMuxerWrapper {
+    fun addTrack(format: MediaFormat): Int
+    fun start()
+    fun writeSampleData(trackIndex: Int, byteBuffer: java.nio.ByteBuffer, bufferInfo: MediaCodec.BufferInfo)
+    fun stop()
+    fun release()
+}
+
+private class PlatformMuxerWrapper(private val muxer: MediaMuxer) : DownloadMuxerWrapper {
+    override fun addTrack(format: MediaFormat): Int = muxer.addTrack(format)
+    override fun start() = muxer.start()
+    override fun writeSampleData(trackIndex: Int, byteBuffer: java.nio.ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
+        muxer.writeSampleData(trackIndex, byteBuffer, bufferInfo)
+    override fun stop() = muxer.stop()
+    override fun release() = muxer.release()
+}
+
+@OptIn(UnstableApi::class)
+private class Media3MuxerWrapper(private val muxer: MediaMuxerCompat) : DownloadMuxerWrapper {
+    override fun addTrack(format: MediaFormat): Int = muxer.addTrack(format)
+    override fun start() = muxer.start()
+    override fun writeSampleData(trackIndex: Int, byteBuffer: java.nio.ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
+        muxer.writeSampleData(trackIndex, byteBuffer, bufferInfo)
+    override fun stop() = muxer.stop()
+    override fun release() = muxer.release()
 }

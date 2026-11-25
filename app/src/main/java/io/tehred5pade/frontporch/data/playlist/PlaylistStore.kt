@@ -36,6 +36,10 @@ class PlaylistStore(context: Context) {
     private val _playlists = MutableStateFlow(load())
     val playlists: StateFlow<List<Playlist>> = _playlists.asStateFlow()
 
+    fun reload() {
+        _playlists.value = load()
+    }
+
     fun create(name: String, initialEntry: PlaylistEntry? = null): Playlist {
         val trimmed = name.trim()
         require(trimmed.isNotBlank()) { "Playlist name cannot be blank" }

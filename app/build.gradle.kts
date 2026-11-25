@@ -17,7 +17,7 @@ android {
         minSdk = 36
         targetSdk = 37
         versionCode = 1
-        versionName = "0.05"
+        versionName = "0.06"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -60,6 +60,8 @@ dependencies {
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.exoplayer.dash)
     implementation(libs.androidx.media3.exoplayer.hls)
+    // B-frame-aware MP4 muxing for downloaded video + audio tracks.
+    implementation(libs.androidx.media3.muxer)
     implementation(libs.androidx.media3.ui)
     implementation(libs.androidx.media3.session)
     implementation(libs.androidx.media)

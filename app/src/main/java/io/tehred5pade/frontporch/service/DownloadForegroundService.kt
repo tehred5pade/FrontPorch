@@ -55,10 +55,13 @@ class DownloadForegroundService : Service() {
 
         serviceScope.launch {
             downloadManager.activeDownloads.collect { downloads ->
-                if (downloads.isEmpty()) {
+                // Failed items stay in the Downloads list for retry, but they are not
+                // in-flight transfers and must not keep this foreground service alive.
+                val running = downloads.values.filterNot { it.isFailed }
+                if (running.isEmpty()) {
                     if (foregroundStarted) stopForegroundAndSelf()
                 } else {
-                    postProgressNotification(downloads.values.toList())
+                    postProgressNotification(running)
                 }
             }
         }
@@ -66,7 +69,7 @@ class DownloadForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         createNotificationChannel()
-        val downloads = downloadManager.activeDownloads.value.values.toList()
+        val downloads = downloadManager.activeDownloads.value.values.filterNot { it.isFailed }.toList()
         if (downloads.isEmpty()) {
             stopForegroundAndSelf()
         } else {
@@ -78,7 +81,7 @@ class DownloadForegroundService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         // Do not stop for an active transfer when the app task is removed. The notification
         // remains the owner until the shared download state is empty.
-        if (downloadManager.activeDownloads.value.isEmpty()) stopForegroundAndSelf()
+        if (downloadManager.activeDownloads.value.values.none { !it.isFailed }) stopForegroundAndSelf()
         super.onTaskRemoved(rootIntent)
     }
 

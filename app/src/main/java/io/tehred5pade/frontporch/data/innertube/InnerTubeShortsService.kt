@@ -29,15 +29,15 @@ sealed interface ShortsFeedFilter {
 
 class InnerTubeShortsService(
     private val okHttpClient: OkHttpClient
-) {
+) : ShortsFeedSource {
     private val androidUserAgent =
         "com.google.android.youtube/20.10.38 (Linux; U; Android 15; en_US) gzip"
 
-    suspend fun searchShortsByQuery(
+    override suspend fun searchShortsByQuery(
         query: String,
         visitorData: String?,
-        paramsOverride: String? = null,
-        preferredAudioLanguage: String = "en"
+        paramsOverride: String?,
+        preferredAudioLanguage: String
     ): Result<List<ShortItem>> = withContext(Dispatchers.IO) {
         runCatching {
             val cleanQuery = "$query $ANTI_SLOP_OPERATORS"
@@ -87,13 +87,20 @@ class InnerTubeShortsService(
 
             // 2. Regex fallback matching both watchEndpoint and reelWatchEndpoint videoIds
             if (results.isEmpty()) {
-                val endpointRegex = Regex(""""(?:reelWatchEndpoint|watchEndpoint)"\s*:\s*\{\s*"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"""")
+                val endpointRegex = Regex(""""(reelWatchEndpoint|watchEndpoint)"\s*:\s*\{\s*"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"""")
                 endpointRegex.findAll(rawJson).forEach { match ->
-                    val id = match.groupValues[1]
+                    val endpointName = match.groupValues[1]
+                    val id = match.groupValues[2]
                     if (seenIds.add(id)) {
                         val title = query.removeSuffix(" #shorts")
                         if (!SlopAndClickbaitFilter.isSlopOrClickbait(title)) {
-                            results.add(ShortItem(id = id, title = title))
+                            results.add(
+                                ShortItem(
+                                    id = id,
+                                    title = title,
+                                    isShortForm = endpointName == "reelWatchEndpoint"
+                                )
+                            )
                         }
                     }
                 }
@@ -108,11 +115,11 @@ class InnerTubeShortsService(
         }
     }
 
-    suspend fun fetchReelSequence(
-        seedVideoId: String? = null,
-        continuation: String? = null,
+    override suspend fun fetchReelSequence(
+        seedVideoId: String?,
+        continuation: String?,
         visitorData: String?,
-        preferredAudioLanguage: String = "en"
+        preferredAudioLanguage: String
     ): Pair<List<ShortItem>, String?> = withContext(Dispatchers.IO) {
         runCatching {
             val hlCode = if (preferredAudioLanguage.isNotBlank() && !preferredAudioLanguage.equals("auto", ignoreCase = true)) {
@@ -166,7 +173,7 @@ class InnerTubeShortsService(
      * The old RSS endpoint is deprecated and often returns an empty feed, which made
      * subscribed channels silently disappear from the mixed Shorts feed.
      */
-    suspend fun fetchChannelShorts(
+    override suspend fun fetchChannelShorts(
         channelId: String,
         channelName: String
     ): List<DatedShortItem> = withContext(Dispatchers.IO) {
@@ -242,7 +249,18 @@ class InnerTubeShortsService(
                             ?: renderer.optJSONObject("title")?.optString("simpleText")
                             ?: "Short"
                         if (!SlopAndClickbaitFilter.isSlopOrClickbait(title, channelName)) {
-                            out.add(ShortItem(id = videoId, title = title, channelTitle = channelName, channelId = channelId))
+                            out.add(
+                                ShortItem(
+                                    id = videoId,
+                                    title = title,
+                                    channelTitle = channelName,
+                                    channelId = channelId,
+                                    durationSeconds = parseDurationSeconds(renderer),
+                                    // This endpoint is the channel's Shorts tab, so every item
+                                    // is short-form by definition even without a length badge.
+                                    isShortForm = true
+                                )
+                            )
                         }
                     }
                 }
@@ -271,7 +289,9 @@ class InnerTubeShortsService(
         if (seedShortVideoId != null) {
             val (relatedReelItems, _) = fetchReelSequence(
                 seedVideoId = seedShortVideoId,
-                visitorData = visitorData
+                continuation = null,
+                visitorData = visitorData,
+                preferredAudioLanguage = "en"
             )
             relatedReelItems.forEach { item ->
                 if (seenIds.add(item.id)) {
@@ -283,7 +303,9 @@ class InnerTubeShortsService(
         val lookalikeQuery = "${subscribedChannel.name} #shorts"
         val searchItems = searchShortsByQuery(
             query = lookalikeQuery,
-            visitorData = visitorData
+            visitorData = visitorData,
+            paramsOverride = null,
+            preferredAudioLanguage = "en"
         ).getOrDefault(emptyList())
 
         searchItems.forEach { item ->
@@ -302,8 +324,8 @@ class InnerTubeShortsService(
     ) {
         when (node) {
             is JSONObject -> {
-                val endpoint = node.optJSONObject("reelWatchEndpoint")
-                    ?: node.optJSONObject("watchEndpoint")
+                val reelEndpoint = node.optJSONObject("reelWatchEndpoint")
+                val endpoint = reelEndpoint ?: node.optJSONObject("watchEndpoint")
 
                 if (endpoint != null) {
                     val videoId = endpoint.optString("videoId")
@@ -334,7 +356,9 @@ class InnerTubeShortsService(
                                     id = videoId,
                                     title = title,
                                     channelTitle = channelName.ifBlank { "YouTube Creator" },
-                                    channelId = channelId
+                                    channelId = channelId,
+                                    durationSeconds = parseDurationSeconds(node),
+                                    isShortForm = reelEndpoint != null
                                 )
                             )
                         }
@@ -351,6 +375,29 @@ class InnerTubeShortsService(
                     extractShortsFromJson(node.get(i), out, seenIds)
                 }
             }
+        }
+    }
+
+    /**
+     * Reads a YouTube length badge ("0:42", "1:02:03") from a renderer. Returns 0 when the
+     * response has no length metadata, which callers treat as "unknown" rather than invalid.
+     */
+    private fun parseDurationSeconds(node: JSONObject): Int {
+        val lengthText = node.optJSONObject("lengthText")
+            ?: node.optJSONObject("thumbnailOverlayTimeStatusRenderer")?.optJSONObject("text")
+        if (lengthText == null) return 0
+
+        val raw = lengthText.optString("simpleText").ifBlank {
+            lengthText.optJSONArray("runs")?.optJSONObject(0)?.optString("text").orEmpty()
+        }
+        if (raw.isBlank()) return 0
+
+        val parts = raw.trim().split(":").mapNotNull { it.trim().toIntOrNull() }
+        return when (parts.size) {
+            1 -> parts[0]
+            2 -> parts[0] * 60 + parts[1]
+            3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
+            else -> 0
         }
     }
 }

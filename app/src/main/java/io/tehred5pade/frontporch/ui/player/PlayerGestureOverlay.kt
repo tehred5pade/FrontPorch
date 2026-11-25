@@ -3,12 +3,29 @@ package io.tehred5pade.frontporch.ui.player
 import android.app.Activity
 import android.content.Context
 import android.media.AudioManager
-import androidx.compose.animation.*
+import android.view.WindowManager
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -23,7 +40,15 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -101,6 +126,25 @@ fun PlayerGestureOverlay(
     }
 
     val activity = context as? Activity
+    val brightnessAdjusted = remember { mutableStateOf(false) }
+
+    // A swipe only overrides this Activity window. Once the player leaves composition,
+    // hand brightness back to the system so other screens are not stuck at the video level.
+    DisposableEffect(Unit) {
+        onDispose {
+            if (brightnessAdjusted.value) {
+                val window = (context as? Activity)?.window
+                if (window != null) {
+                    val lp = window.attributes
+                    if (lp.screenBrightness != WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE) {
+                        lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                        window.attributes = lp
+                    }
+                }
+            }
+        }
+    }
+
     val pixelsPerPercent = with(density) { 4.5f.dp.toPx() }
     val pixelsPerSecond = with(density) { 15f.dp.toPx() }
 
@@ -201,6 +245,7 @@ fun PlayerGestureOverlay(
                                             val newB = (currentB + deltaFrac).coerceIn(0.01f, 1.0f)
                                             lp.screenBrightness = newB
                                             window.attributes = lp
+                                            brightnessAdjusted.value = true
                                             showIndicator(IndicatorType.BRIGHTNESS, newB)
                                         }
                                     } else if (isRightSwipe) {

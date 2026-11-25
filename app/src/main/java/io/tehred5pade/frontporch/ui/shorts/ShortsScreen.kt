@@ -10,34 +10,61 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.pager.VerticalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.foundation.pager.VerticalPager
-import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import coil3.compose.AsyncImage
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.media3.common.C
@@ -51,15 +78,16 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.ui.PlayerView
+import coil3.compose.AsyncImage
 import io.tehred5pade.frontporch.FrontPorchApp
 import io.tehred5pade.frontporch.R
 import io.tehred5pade.frontporch.ResolvedShortStream
 import io.tehred5pade.frontporch.ResolvedStream
-import io.tehred5pade.frontporch.resolveShortStream
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockRepository
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
+import io.tehred5pade.frontporch.resolveShortStream
 import io.tehred5pade.frontporch.ui.models.ShortItem
 import io.tehred5pade.frontporch.ui.player.KeepScreenOnEffect
 import io.tehred5pade.frontporch.ui.player.applyCaptionTrackSelection
@@ -76,6 +104,18 @@ private const val SHORT_PREPARE_TIMEOUT_MS = 30_000L
 private const val SHORT_RENDER_TIMEOUT_MS = 16_000L
 private const val SHORT_WATCHDOG_POLL_MS = 200L
 
+/**
+ * One-shot request from another tab to play a specific Short. The token makes repeat
+ * selections of the same Short distinct so Compose always treats them as a new request.
+ */
+data class ShortLaunchRequest(
+    val token: Int,
+    val videoId: String,
+    val title: String,
+    val channelId: String = "",
+    val channelTitle: String = ""
+)
+
 private fun isResumed(lifecycle: Lifecycle?): Boolean =
     lifecycle == null || lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
 
@@ -85,6 +125,8 @@ fun ShortsScreen(
     viewModel: ShortsViewModel,
     // Bumped when the Shorts tab is tapped again: reload and restart from the first Short.
     reloadTick: Int = 0,
+    requestedShort: ShortLaunchRequest? = null,
+    onRequestedShortHandled: (Int) -> Unit = {},
     shorts: List<ShortItem>,
     isLoading: Boolean,
     errorMessage: String?,
@@ -107,6 +149,26 @@ fun ShortsScreen(
 
     val context = LocalContext.current
     val app = context.applicationContext as FrontPorchApp
+
+    // A Short opened from Search or Channel page stays pending until the Shorts page is visible.
+    LaunchedEffect(requestedShort?.token, isPageActive) {
+        val request = requestedShort ?: return@LaunchedEffect
+        if (!isPageActive) return@LaunchedEffect
+
+        if (viewModel.canOpenRequestedShort(request.videoId, request.channelId)) {
+            val existingIndex = shorts.indexOfFirst { it.id == request.videoId }
+            if (existingIndex < 0) {
+                viewModel.openRequestedShort(
+                    ShortItem(
+                        id = request.videoId,
+                        title = request.title,
+                        channelTitle = request.channelTitle,
+                        channelId = request.channelId
+                    )
+                )
+            }
+        }
+    }
 
     if (shorts.isEmpty()) {
         Box(
@@ -143,15 +205,25 @@ fun ShortsScreen(
     }
 
     LaunchedEffect(reloadTick) {
-        // Tapping the Shorts tab again only rewinds to the first Short. Keep the feed and
-        // both players alive so playback resumes from the already-buffered first Short
-        // instead of repeating the slow cold-start discovery. New content is appended in
-        // the background. The tick is consumed once in the ViewModel (which outlives this
-        // composable) so it cannot re-fire after an empty-list disposal.
+        // Switching back to the Shorts tab preserves current scroll position while
+        // fetching fresh discovery items in the background.
         if (!viewModel.consumeReloadTick(reloadTick)) return@LaunchedEffect
-        pagerState.scrollToPage(0)
         viewModel.refreshInBackground()
     }
+
+    // A Short opened from Search stays pending until the Shorts page is actually visible,
+    // so the pager cannot consume it while this tab is still mounted in the background.
+    LaunchedEffect(requestedShort?.token, isPageActive, shorts) {
+        val request = requestedShort ?: return@LaunchedEffect
+        if (!isPageActive || shorts.isEmpty()) return@LaunchedEffect
+
+        val existingIndex = shorts.indexOfFirst { it.id == request.videoId }
+        if (existingIndex >= 0) {
+            pagerState.scrollToPage(existingIndex)
+            onRequestedShortHandled(request.token)
+        }
+    }
+
     val overscrollY = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
     val streamCache = remember { mutableStateMapOf<String, ResolvedShortStream>() }

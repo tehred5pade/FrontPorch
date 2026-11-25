@@ -6,17 +6,56 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalTextStyle
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -25,22 +64,23 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import io.tehred5pade.frontporch.data.db.SubscriptionEntity
 import io.tehred5pade.frontporch.data.download.DownloadSettingsStore
+import io.tehred5pade.frontporch.data.importexport.FrontPorchBackupManager
 import io.tehred5pade.frontporch.data.importexport.SubscriptionExporter
-import io.tehred5pade.frontporch.data.model.ShortsCategoryItem
-import io.tehred5pade.frontporch.data.prefs.ShortRepeatCooldown
+import io.tehred5pade.frontporch.data.local.FrontPorchDatabase
+import io.tehred5pade.frontporch.data.playlist.PlaylistStore
 import io.tehred5pade.frontporch.data.prefs.UserSettings
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorCategory
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.ui.common.InlineMenu
-import io.tehred5pade.frontporch.update.UpdateSettingsSection
 import io.tehred5pade.frontporch.ui.theme.AppBackgroundTheme
 import io.tehred5pade.frontporch.ui.theme.AppHighlightColor
+import io.tehred5pade.frontporch.update.UpdateSettingsSection
 import kotlinx.coroutines.launch
 
 private val SettingsTextOnDark = Color(0xFFC8CDD6)
@@ -89,9 +129,6 @@ fun SettingsScreen(
     onBackgroundThemeSelected: (AppBackgroundTheme) -> Unit,
     onHighlightColorSelected: (AppHighlightColor) -> Unit,
     onSponsorBlockChanged: (Boolean) -> Unit,
-    onCategoriesChanged: (Set<String>) -> Unit,
-    onCustomCategoriesChanged: (Set<String>) -> Unit,
-    onRepeatCooldownChanged: (ShortRepeatCooldown) -> Unit = {},
     onAudioLanguageChanged: (String) -> Unit = {},
     onWifiQualityChanged: (Int, Int) -> Unit = { _, _ -> },
     onMobileQualityChanged: (Int, Int) -> Unit = { _, _ -> },
@@ -116,7 +153,6 @@ fun SettingsScreen(
         if (reloadTick > 0) listState.scrollToItem(0)
     }
 
-    var showCategoriesSubMenu by remember { mutableStateOf(false) }
     var showSponsorBlockSubMenu by remember { mutableStateOf(false) }
 
     val storagePermissionLauncher = rememberLauncherForActivityResult(
@@ -183,15 +219,12 @@ fun SettingsScreen(
             )
         }
 
-        // 4. Categories Section (Button opening Sub Menu)
+        // 3.5. Full Backup & Restore Section
         item {
-            CategoriesButtonCard(
-                selectedCount = userSettings.selectedCategoryIds.size,
-                onClickConfigure = { showCategoriesSubMenu = true }
-            )
+            FullBackupSettingsSection()
         }
 
-        // 5. SponsorBlock Section (Toggle + Make Adjustments Button)
+        // 4. SponsorBlock Section (Toggle + Make Adjustments Button)
         item {
             SponsorBlockMainCard(
                 onSponsorBlockChanged = onSponsorBlockChanged,
@@ -293,17 +326,6 @@ fun SettingsScreen(
         item {
             UpdateSettingsSection()
         }
-    }
-
-    // Sub Menu: Categories & Shorts Feed Configuration
-    if (showCategoriesSubMenu) {
-        CategoriesSubMenuDialog(
-            userSettings = userSettings,
-            onCategoriesChanged = onCategoriesChanged,
-            onCustomCategoriesChanged = onCustomCategoriesChanged,
-            onRepeatCooldownChanged = onRepeatCooldownChanged,
-            onDismiss = { showCategoriesSubMenu = false }
-        )
     }
 
     // Sub Menu: SponsorBlock Adjustments
@@ -677,40 +699,6 @@ fun QualitySettingsCard(
 }
 
 @Composable
-fun CategoriesButtonCard(
-    selectedCount: Int,
-    onClickConfigure: () -> Unit
-) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        shape = RoundedCornerShape(14.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            SettingsText(
-                text = "Categories & Shorts Feeds",
-                style = MaterialTheme.typography.titleMedium
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            SettingsText(
-                text = "If nothing is selected, your subscribed channels are prioritized to base what type of Shorts to play. Selecting categories adds those topics to your feed while avoiding clickbait.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            Button(
-                onClick = onClickConfigure,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                SettingsText(
-                    text = if (selectedCount > 0) "Configure Categories ($selectedCount selected)" else "Configure Categories"
-                )
-            }
-        }
-    }
-}
-
-@Composable
 fun SponsorBlockMainCard(
     onSponsorBlockChanged: (Boolean) -> Unit,
     onClickMakeAdjustments: () -> Unit
@@ -767,144 +755,6 @@ fun SponsorBlockMainCard(
             }
         }
     }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-fun CategoriesSubMenuDialog(
-    userSettings: UserSettings,
-    onCategoriesChanged: (Set<String>) -> Unit,
-    onCustomCategoriesChanged: (Set<String>) -> Unit,
-    onRepeatCooldownChanged: (ShortRepeatCooldown) -> Unit,
-    onDismiss: () -> Unit
-) {
-    var newCategoryInput by remember { mutableStateOf("") }
-
-    val customCategories = userSettings.customCategories.mapNotNull { serialized ->
-        val parts = serialized.split("::")
-        if (parts.size >= 3) {
-            ShortsCategoryItem(id = parts[0], label = parts[1], seedQuery = parts[2], isCustom = true)
-        } else null
-    }
-
-    val allCategories = ShortsCategoryItem.presets + customCategories
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { SettingsText("Categories & Shorts Feed") },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-            ) {
-                SettingsText(
-                    text = "If no categories are selected, your subscribed channels are prioritized to base what type of Shorts to play. Selecting categories adds those topics to your feed while avoiding clickbait Shorts.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-
-                // Custom Category Input
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    OutlinedTextField(
-                        value = newCategoryInput,
-                        onValueChange = { newCategoryInput = it },
-                        placeholder = { SettingsText("Custom category (e.g. DIY)") },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f)
-                    )
-                    IconButton(
-                        onClick = {
-                            val trimmed = newCategoryInput.trim()
-                            if (trimmed.isNotEmpty()) {
-                                val customId = "custom_${System.currentTimeMillis()}"
-                                val serialized = "$customId::$trimmed::$trimmed #shorts"
-                                val updatedCustoms = userSettings.customCategories + serialized
-                                val updatedSelected = userSettings.selectedCategoryIds + customId
-
-                                onCustomCategoriesChanged(updatedCustoms)
-                                onCategoriesChanged(updatedSelected)
-                                newCategoryInput = ""
-                            }
-                        }
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = "Add")
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    allCategories.forEach { category ->
-                        val isSelected = category.id in userSettings.selectedCategoryIds
-                        FilterChip(
-                            selected = isSelected,
-                            onClick = {
-                                val updated = if (isSelected) {
-                                    userSettings.selectedCategoryIds - category.id
-                                } else {
-                                    userSettings.selectedCategoryIds + category.id
-                                }
-                                onCategoriesChanged(updated)
-                            },
-                            label = { SettingsText(category.label) },
-                            trailingIcon = if (category.isCustom) {
-                                {
-                                    Icon(
-                                        Icons.Default.Close,
-                                        contentDescription = "Delete custom",
-                                        modifier = Modifier.size(16.dp).clickable {
-                                            val serializedToRemove = userSettings.customCategories.find { it.startsWith(category.id) }
-                                            if (serializedToRemove != null) {
-                                                onCustomCategoriesChanged(userSettings.customCategories - serializedToRemove)
-                                            }
-                                            onCategoriesChanged(userSettings.selectedCategoryIds - category.id)
-                                        }
-                                    )
-                                }
-                            } else null
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                SettingsText(text = "Repeat Video Filter", style = MaterialTheme.typography.titleSmall)
-                SettingsText(
-                    text = "Control how often a Short you have already watched can appear again.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    ShortRepeatCooldown.entries.forEach { option ->
-                        FilterChip(
-                            selected = userSettings.repeatCooldown == option,
-                            onClick = { onRepeatCooldownChanged(option) },
-                            label = { SettingsText(option.label) }
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { SettingsText("Done") }
-        }
-    )
 }
 
 @Composable
@@ -1242,6 +1092,114 @@ fun NewPipeImportSettingsSection(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 SettingsText("Manage Channels", maxLines = 1)
+            }
+
+            if (statusMessage != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                SettingsText(
+                    text = statusMessage!!,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun FullBackupSettingsSection() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    val db = FrontPorchDatabase.getDatabase(context)
+    val subscriptionDao = db.subscriptionsDao()
+    val playlistStore = remember(context) { PlaylistStore(context) }
+
+    val exportFullLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                runCatching {
+                    val json = FrontPorchBackupManager.exportBackup(context, db, subscriptionDao, playlistStore)
+                    context.contentResolver.openOutputStream(uri)?.use { output ->
+                        output.write(json.toByteArray(Charsets.UTF_8))
+                    } ?: error("Unable to open backup file for writing")
+                }.onSuccess {
+                    statusMessage = "Full backup exported successfully."
+                }.onFailure { err ->
+                    statusMessage = "Backup export failed: ${err.message}"
+                }
+            }
+        }
+    }
+
+    val importFullLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                runCatching {
+                    val json = context.contentResolver.openInputStream(uri)?.use { input ->
+                        input.bufferedReader().readText()
+                    } ?: error("Unable to read backup file")
+                    FrontPorchBackupManager.importBackup(context, db, subscriptionDao, playlistStore, json).getOrThrow()
+                }.onSuccess { summary ->
+                    statusMessage = "Restored: ${summary.channelsImported} channels, ${summary.playlistsImported} playlists, ${summary.algorithmEntriesImported} shorts algorithm entries."
+                }.onFailure { err ->
+                    statusMessage = "Backup import failed: ${err.message}"
+                }
+            }
+        }
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            SettingsText(
+                text = "Full App Backup & Restore",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            SettingsText(
+                text = "Backup or restore system settings, playlists, subscribed channels, and your YouTube Shorts recommendation profile.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Button(
+                    onClick = { importFullLauncher.launch(arrayOf("application/json", "*/*")) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    SettingsText(
+                        text = "Import Backup",
+                        modifier = Modifier.fillMaxWidth(),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = { exportFullLauncher.launch("frontporch_full_backup.json") },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    SettingsText(
+                        text = "Export Backup",
+                        modifier = Modifier.fillMaxWidth(),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center
+                    )
+                }
             }
 
             if (statusMessage != null) {
