@@ -145,8 +145,6 @@ fun SettingsScreen(
     onBackOverlayChanged: (String, Boolean) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
-    val settingsStore = remember { DownloadSettingsStore(context) }
-    var folderLabel by remember { mutableStateOf(settingsStore.getDisplayFolderPath()) }
     val listState = rememberLazyListState()
 
     LaunchedEffect(reloadTick) {
@@ -154,21 +152,6 @@ fun SettingsScreen(
     }
 
     var showSponsorBlockSubMenu by remember { mutableStateOf(false) }
-
-    val storagePermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* Permission result handled */ }
-
-    val folderPickerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree()
-    ) { uri ->
-        if (uri != null) {
-            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            runCatching { context.contentResolver.takePersistableUriPermission(uri, flags) }
-            settingsStore.setCustomFolderUri(uri)
-            folderLabel = settingsStore.getDisplayFolderPath()
-        }
-    }
 
     LazyColumn(
         state = listState,
@@ -279,50 +262,7 @@ fun SettingsScreen(
             }
         }
 
-        // 8. Download Location & Storage Section
-        item {
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    SettingsText(
-                        text = "Download Location & Storage",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    SettingsText(
-                        text = folderLabel,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { folderPickerLauncher.launch(settingsStore.getCustomFolderUri()) }) {
-                            SettingsText("Choose Folder")
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                val perms = if (android.os.Build.VERSION.SDK_INT >= 33) {
-                                    arrayOf(android.Manifest.permission.READ_MEDIA_VIDEO)
-                                } else {
-                                    arrayOf(
-                                        android.Manifest.permission.READ_EXTERNAL_STORAGE,
-                                        android.Manifest.permission.WRITE_EXTERNAL_STORAGE
-                                    )
-                                }
-                                storagePermissionLauncher.launch(perms)
-                            }
-                        ) {
-                            SettingsText("Grant Storage Permission")
-                        }
-                    }
-                }
-            }
-        }
-
-        // 9. App Updates (GitHub Releases / APK installer)
+        // 8. App Updates (GitHub Releases / APK installer)
         item {
             UpdateSettingsSection()
         }
@@ -1122,8 +1062,12 @@ fun FullBackupSettingsSection() {
             scope.launch {
                 runCatching {
                     val json = FrontPorchBackupManager.exportBackup(context, db, subscriptionDao, playlistStore)
-                    context.contentResolver.openOutputStream(uri)?.use { output ->
+                    context.contentResolver.openOutputStream(uri, "rwt")?.use { output ->
                         output.write(json.toByteArray(Charsets.UTF_8))
+                        output.flush()
+                    } ?: context.contentResolver.openOutputStream(uri)?.use { output ->
+                        output.write(json.toByteArray(Charsets.UTF_8))
+                        output.flush()
                     } ?: error("Unable to open backup file for writing")
                 }.onSuccess {
                     statusMessage = "Full backup exported successfully."

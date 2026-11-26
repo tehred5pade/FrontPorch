@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -48,6 +49,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.layout.ContentScale
+import coil3.compose.AsyncImage
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -273,7 +276,9 @@ private fun SearchPillButton(
                 text = label,
                 style = MaterialTheme.typography.labelMedium,
                 color = if (selected) scheme.onSurface else scheme.onSurfaceVariant,
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1,
+                softWrap = false
             )
             if (trailingIcon != null) {
                 Spacer(modifier = Modifier.width(4.dp))
@@ -325,7 +330,8 @@ fun YouTubeSearchResultsScreen(
         videoId: String,
         title: String,
         channelId: String,
-        channelTitle: String
+        channelTitle: String,
+        searchQuery: String
     ) -> Unit,
     onOpenChannel: (channelId: String, channelTitle: String) -> Unit,
     onToggleSubscribe: (channelId: String, channelTitle: String) -> Unit,
@@ -557,21 +563,18 @@ fun YouTubeSearchResultsScreen(
                         }
                     )
 
-                    InlineMenu(
+                    DropdownMenu(
                         expanded = sortMenuExpanded,
-                        onDismiss = { sortMenuExpanded = false },
-                        hazeState = hazeState,
-                        glassStyle = glassStyle,
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(top = 44.dp)
-                            .zIndex(3f)
+                        onDismissRequest = { sortMenuExpanded = false }
                     ) {
                         SearchSort.entries.forEach { sortOption ->
                             DropdownMenuItem(
                                 text = {
                                     Text(
                                         text = sortOption.label,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis,
                                         color = if (sortOption == selectedSort) {
                                             scheme.primary
                                         } else {
@@ -677,7 +680,8 @@ fun YouTubeSearchResultsScreen(
                                             item.id,
                                             item.title,
                                             item.channelId,
-                                            item.channelTitle
+                                            item.channelTitle,
+                                            query
                                         )
                                     }
                                 )
@@ -840,7 +844,8 @@ private fun SearchShortRow(
                 videoId = shortItem.id,
                 contentDescription = shortItem.title,
                 okHttpClient = okHttpClient,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier.fillMaxSize(),
+                thumbnailUrl = shortItem.thumbnailUrl.ifBlank { null }
             )
             Surface(
                 color = scheme.primary,
@@ -906,11 +911,20 @@ private fun SearchChannelRow(
                 .clip(CircleShape)
                 .background(scheme.primaryContainer)
         ) {
-            Text(
-                text = channel.title.take(1).uppercase(),
-                style = MaterialTheme.typography.titleMedium,
-                color = scheme.onPrimaryContainer
-            )
+            if (channel.avatarUrl.isNotBlank()) {
+                AsyncImage(
+                    model = channel.avatarUrl,
+                    contentDescription = "Avatar for ${channel.title}",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                Text(
+                    text = channel.title.take(1).uppercase(),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = scheme.onPrimaryContainer
+                )
+            }
         }
 
         Spacer(modifier = Modifier.width(12.dp))

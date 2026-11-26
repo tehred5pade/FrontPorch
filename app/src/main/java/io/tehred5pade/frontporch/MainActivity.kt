@@ -667,14 +667,15 @@ class MainActivity : ComponentActivity() {
                                                 onPlayVideo = { id, title, channel ->
                                                     openQueueVideo(QueueVideoItem(id, title, channel))
                                                 },
-                                                onPlayShort = { videoId, title, channelId, channelTitle ->
+                                                onPlayShort = { videoId, title, channelId, channelTitle, searchQuery ->
                                                     shortLaunchToken += 1
                                                     requestedShort = ShortLaunchRequest(
                                                         token = shortLaunchToken,
                                                         videoId = videoId,
                                                         title = title,
                                                         channelId = channelId,
-                                                        channelTitle = channelTitle
+                                                        channelTitle = channelTitle,
+                                                        searchQuery = searchQuery
                                                     )
                                                     selectTab(AppTab.SHORTS.ordinal)
                                                 },
@@ -768,7 +769,8 @@ class MainActivity : ComponentActivity() {
                                                             )
                                                         }
                                                     }
-                                                }
+                                                },
+                                                onNavigateToSubscriptions = { selectTab(AppTab.SUBSCRIPTIONS.ordinal) }
                                             )
 
                                             AppTab.SETTINGS -> SettingsScreen(
@@ -1066,12 +1068,6 @@ class MainActivity : ComponentActivity() {
                                                 contentDescription = tab.label
                                             )
                                         },
-                                        label = {
-                                            Text(
-                                                text = tab.label,
-                                                style = MaterialTheme.typography.labelSmall
-                                            )
-                                        },
                                         colors = NavigationRailItemDefaults.colors(
                                             selectedIconColor = scheme.onSurface,
                                             selectedTextColor = scheme.onSurface,
@@ -1120,7 +1116,10 @@ class MainActivity : ComponentActivity() {
                                 containerColor = Color.Transparent,
                                 contentColor = scheme.onSurface,
                                 tonalElevation = 0.dp,
-                                modifier = Modifier.navigationBarsPadding()
+                                windowInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
+                                modifier = Modifier
+                                    .height(56.dp)
+                                    .navigationBarsPadding()
                             ) {
                                 tabs.forEachIndexed { index, tab ->
                                     NavigationBarItem(
@@ -1130,13 +1129,6 @@ class MainActivity : ComponentActivity() {
                                             Icon(
                                                 imageVector = tab.icon,
                                                 contentDescription = tab.label
-                                            )
-                                        },
-                                        label = {
-                                            Text(
-                                                text = tab.label,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                maxLines = 1
                                             )
                                         },
                                         colors = NavigationBarItemDefaults.colors(

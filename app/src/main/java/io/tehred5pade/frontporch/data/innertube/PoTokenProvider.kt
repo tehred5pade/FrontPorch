@@ -47,6 +47,8 @@ object PoTokenProvider {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     settings.mediaPlaybackRequiresUserGesture = true
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
                 }
 
                 fun finish(result: YouTubeSessionTokens?) {

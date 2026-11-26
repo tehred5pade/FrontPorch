@@ -1,8 +1,10 @@
 package io.tehred5pade.frontporch.ui.shorts
 
+import android.content.Intent
 import android.net.Uri
 import android.view.LayoutInflater
 import android.view.ViewGroup
+import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
@@ -26,6 +28,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ClosedCaption
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material3.Button
@@ -100,8 +103,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-private const val SHORT_PREPARE_TIMEOUT_MS = 30_000L
-private const val SHORT_RENDER_TIMEOUT_MS = 16_000L
+private const val SHORT_PREPARE_TIMEOUT_MS = 40_000L
+private const val SHORT_RENDER_TIMEOUT_MS = 25_000L
 private const val SHORT_WATCHDOG_POLL_MS = 200L
 
 /**
@@ -113,7 +116,8 @@ data class ShortLaunchRequest(
     val videoId: String,
     val title: String,
     val channelId: String = "",
-    val channelTitle: String = ""
+    val channelTitle: String = "",
+    val searchQuery: String = ""
 )
 
 private fun isResumed(lifecycle: Lifecycle?): Boolean =
@@ -143,32 +147,17 @@ fun ShortsScreen(
     onLikeShort: (ShortItem) -> Unit = {},
     onDislikeShort: (ShortItem) -> Unit = {},
     onOpenChannel: (channelId: String, channelTitle: String) -> Unit = { _, _ -> },
-    onToggleSubscribe: (channelId: String, channelTitle: String) -> Unit = { _, _ -> }
+    onToggleSubscribe: (channelId: String, channelTitle: String) -> Unit = { _, _ -> },
+    onNavigateToSubscriptions: () -> Unit = {}
 ) {
+    BackHandler(enabled = isPageActive) {
+        onNavigateToSubscriptions()
+    }
+
     KeepScreenOnEffect(keepScreenOn = isPageActive && shorts.isNotEmpty())
 
     val context = LocalContext.current
     val app = context.applicationContext as FrontPorchApp
-
-    // A Short opened from Search or Channel page stays pending until the Shorts page is visible.
-    LaunchedEffect(requestedShort?.token, isPageActive) {
-        val request = requestedShort ?: return@LaunchedEffect
-        if (!isPageActive) return@LaunchedEffect
-
-        if (viewModel.canOpenRequestedShort(request.videoId, request.channelId)) {
-            val existingIndex = shorts.indexOfFirst { it.id == request.videoId }
-            if (existingIndex < 0) {
-                viewModel.openRequestedShort(
-                    ShortItem(
-                        id = request.videoId,
-                        title = request.title,
-                        channelTitle = request.channelTitle,
-                        channelId = request.channelId
-                    )
-                )
-            }
-        }
-    }
 
     if (shorts.isEmpty()) {
         Box(
@@ -211,16 +200,31 @@ fun ShortsScreen(
         viewModel.refreshInBackground()
     }
 
-    // A Short opened from Search stays pending until the Shorts page is actually visible,
-    // so the pager cannot consume it while this tab is still mounted in the background.
+    // A Short opened from Search or Channel page stays pending until the Shorts page is
+    // actually visible, so the pager cannot consume it while this tab is still mounted in
+    // the background. One effect owns the whole launch flow so the "not in feed yet → open"
+    // and "in feed → scroll to it" transitions cannot race each other across recompositions.
     LaunchedEffect(requestedShort?.token, isPageActive, shorts) {
         val request = requestedShort ?: return@LaunchedEffect
-        if (!isPageActive || shorts.isEmpty()) return@LaunchedEffect
+        if (!isPageActive) return@LaunchedEffect
 
         val existingIndex = shorts.indexOfFirst { it.id == request.videoId }
         if (existingIndex >= 0) {
             pagerState.scrollToPage(existingIndex)
             onRequestedShortHandled(request.token)
+            return@LaunchedEffect
+        }
+
+        if (viewModel.canOpenRequestedShort(request.videoId, request.channelId)) {
+            viewModel.openRequestedShort(
+                ShortItem(
+                    id = request.videoId,
+                    title = request.title,
+                    channelTitle = request.channelTitle,
+                    channelId = request.channelId
+                ),
+                request.searchQuery
+            )
         }
     }
 
@@ -233,6 +237,30 @@ fun ShortsScreen(
     // leave the next Short waiting on a fresh 1-10s YouTube player request.
     val prefetchScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
     val prefetchInFlight = remember { java.util.concurrent.ConcurrentHashMap.newKeySet<String>() }
+
+    // Pre-resolve the first Short immediately so opening the tab starts instantly with zero delay.
+    LaunchedEffect(shorts.firstOrNull()?.id) {
+        val firstShort = shorts.firstOrNull() ?: return@LaunchedEffect
+        if (firstShort.id.isNotBlank() && firstShort.resolvedStream == null && firstShort.id !in streamCache) {
+            val shortId = firstShort.id
+            if (prefetchInFlight.add(shortId)) {
+                prefetchScope.launch {
+                    try {
+                        resolveShortStream(
+                            app.okHttpClient,
+                            shortId,
+                            app.cachedVisitorData,
+                            maxStreamHeight,
+                            preferredAudioLanguage,
+                            streamTargetFps
+                        ).getOrNull()?.let { streamCache[shortId] = it }
+                    } finally {
+                        prefetchInFlight.remove(shortId)
+                    }
+                }
+            }
+        }
+    }
 
     var showShortsControls by remember { mutableStateOf(true) }
     var currentShortCaption by remember { mutableStateOf("Off") }
@@ -262,8 +290,12 @@ fun ShortsScreen(
     // Strictly 2 ExoPlayer instances
     val playerPool = remember {
         List(2) { slotIndex ->
+            val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
+                .setBufferDurationsMs(1500, 15000, 500, 1000)
+                .build()
             ExoPlayer.Builder(context)
                 .setMediaSourceFactory(mediaSourceFactory)
+                .setLoadControl(loadControl)
                 .build()
                 .apply {
                     repeatMode = Player.REPEAT_MODE_ONE
@@ -414,23 +446,20 @@ fun ShortsScreen(
         }
     }
 
-    // Trigger pagination 3 Shorts before the end
+    // Trigger pagination 10 Shorts before the end for seamless infinite scrolling
     LaunchedEffect(pagerState.currentPage, shorts.size) {
-        if (pagerState.currentPage >= shorts.size - 3) {
+        if (pagerState.currentPage >= shorts.size - 10) {
             onLoadMore()
         }
     }
 
-    // Resolve streams several Shorts ahead. Only the immediate next Short can be buffered
-    // into the standby ExoPlayer, but the resolved-stream cache is cheap to fill. By the time
-    // the user reaches a Short its player request has already finished, so no spinner is
-    // needed for resolution.
+    // Resolve streams 10 Shorts ahead in background so swipes render without delay.
     LaunchedEffect(shorts, pagerState.currentPage) {
         val first = pagerState.currentPage + 1
         if (first > shorts.lastIndex) return@LaunchedEffect
-        val last = (first + 5).coerceAtMost(shorts.lastIndex)
+        val last = (first + 10).coerceAtMost(shorts.lastIndex)
         for (index in first..last) {
-            if (prefetchInFlight.size >= 4) break
+            if (prefetchInFlight.size >= 10) break
             val short = shorts.getOrNull(index) ?: continue
             if (short.id.isBlank() || short.resolvedStream != null || short.id in streamCache) continue
             if (!prefetchInFlight.add(short.id)) continue
@@ -497,10 +526,29 @@ fun ShortsScreen(
         player.prepare()
     }
 
+    var lastActiveIndex by remember { mutableStateOf(-1) }
+    var lastActiveStartTime by remember { mutableStateOf(System.currentTimeMillis()) }
+
     // Key ONLY on page index and current videoId so list appends never restart playback
     LaunchedEffect(pagerState.currentPage, currentShortId) {
         val currentIndex = pagerState.currentPage
         val currentShort = shorts.getOrNull(currentIndex) ?: return@LaunchedEffect
+
+        if (lastActiveIndex in shorts.indices && lastActiveIndex != currentIndex) {
+            val prevShort = shorts[lastActiveIndex]
+            val prevSlot = lastActiveIndex % 2
+            val prevPlayer = playerPool.getOrNull(prevSlot)
+            val durationMs = prevPlayer?.duration ?: 0L
+            val positionMs = prevPlayer?.currentPosition ?: 0L
+            val watchedMs = (System.currentTimeMillis() - lastActiveStartTime).coerceAtLeast(0L)
+            val completionPercent = if (durationMs > 0L) {
+                (positionMs.toDouble() / durationMs.toDouble()).coerceIn(0.0, 1.0)
+            } else 0.0
+
+            viewModel.recordShortWatch(prevShort, completionPercent, watchedMs)
+        }
+        lastActiveIndex = currentIndex
+        lastActiveStartTime = System.currentTimeMillis()
 
         val activeSlot = currentIndex % 2
         val preloadSlot = (currentIndex + 1) % 2
@@ -578,6 +626,8 @@ fun ShortsScreen(
             }
             if (!isResumed(lifecycle)) {
                 waited = 0L
+            } else if (slotBuffering[slot]) {
+                waited = 0L
             } else if (waited >= SHORT_PREPARE_TIMEOUT_MS) {
                 viewModel.hideBrokenShort(short.id, "prep-timeout")
                 return@LaunchedEffect
@@ -596,6 +646,8 @@ fun ShortsScreen(
                 return@LaunchedEffect
             }
             if (!isResumed(lifecycle)) {
+                waited = 0L
+            } else if (slotBuffering[slot]) {
                 waited = 0L
             } else if (waited >= SHORT_RENDER_TIMEOUT_MS) {
                 viewModel.hideBrokenShort(short.id, "render-timeout")
@@ -860,6 +912,30 @@ fun ShortsScreen(
                             imageVector = Icons.Filled.ThumbDown,
                             contentDescription = if (isDisliked) "Remove Dislike" else "Dislike Short",
                             tint = if (isDisliked) MaterialTheme.colorScheme.primary else Color.White,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    IconButton(
+                        onClick = {
+                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, "https://www.youtube.com/shorts/${pageShort.id}")
+                            }
+                            val chooser = Intent.createChooser(shareIntent, "Share Short").apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            runCatching { context.startActivity(chooser) }
+                        },
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.45f))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Share Short",
+                            tint = Color.White,
                             modifier = Modifier.size(22.dp)
                         )
                     }

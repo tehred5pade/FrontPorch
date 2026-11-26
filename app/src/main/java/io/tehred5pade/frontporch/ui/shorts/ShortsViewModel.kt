@@ -90,9 +90,26 @@ class ShortsViewModel(
     }
 
     /** Prepend a user-selected Short so it plays immediately instead of waiting for discovery. */
-    fun openRequestedShort(short: ShortItem) {
+    fun openRequestedShort(short: ShortItem, searchQuery: String = "") {
         _shorts.update { current ->
             (listOf(short) + current.filterNot { it.id == short.id }).distinctBy { it.id }
+        }
+        if (searchQuery.isNotBlank()) {
+            viewModelScope.launch {
+                val results = shortsService.searchShortsByQuery(
+                    query = searchQuery,
+                    visitorData = visitorData,
+                    paramsOverride = null,
+                    preferredAudioLanguage = userSettings.value.preferredAudioLanguage
+                ).getOrDefault(emptyList())
+                if (results.isNotEmpty()) {
+                    _shorts.update { current ->
+                        (listOf(short) + results + current.filterNot { it.id == short.id })
+                            .filter { isAllowedShort(it) }
+                            .distinctBy { it.id }
+                    }
+                }
+            }
         }
     }
 
@@ -160,6 +177,13 @@ class ShortsViewModel(
         }
     }
 
+    fun recordShortWatch(short: ShortItem, completionPercent: Double, watchedMs: Long) {
+        viewModelScope.launch {
+            settingsRepository.recordShortViewed(short.id)
+            recommendationEngine.recordWatch(short, completionPercent, watchedMs)
+        }
+    }
+
     fun likeShort(short: ShortItem) {
         viewModelScope.launch {
             val isLiked = short.id !in userSettings.value.likedShortIds
@@ -201,11 +225,9 @@ class ShortsViewModel(
                 if (channelNowBlocked) {
                     list.filterNot { it.channelId == short.channelId }
                 } else {
-                    list.filterNot { it.id == short.id }
+                    list.filterNot { it.id == short.id || it.channelId == short.channelId }
                 }
             }
-            val ranked = recommendationEngine.rankCandidates(_shorts.value)
-            _shorts.value = ranked
         }
     }
 
@@ -265,41 +287,36 @@ class ShortsViewModel(
      * Smallest possible first batch. No stream resolution happens here, so the pager can be
      * populated and the visible Short can start resolving immediately.
      */
-    private suspend fun fetchQuickShortsBatch(): List<ShortItem> = coroutineScope {
+    private suspend fun fetchQuickShortsBatch(): List<ShortItem> {
         val settings = userSettings.value
-        val raw = runCatching { subscriptionDao.getAllOnce() }.getOrDefault(emptyList())
-        val candidates = if (raw.isEmpty()) {
-            // No subscriptions: only honor explicitly selected categories and thumbs-up-similar.
-            val categoryItems = selectedCategoryItems()
-            val categoryResults = if (categoryItems.isEmpty()) {
-                emptyList()
-            } else {
-                categoryItems.shuffled().take(2).map { cat ->
-                    async(Dispatchers.IO) {
-                        shortsService.searchShortsByQuery(
-                            query = cat.seedQuery,
-                            visitorData = visitorData,
-                            paramsOverride = null,
-                            preferredAudioLanguage = settings.preferredAudioLanguage
-                        ).getOrDefault(emptyList())
-                    }
-                }.awaitAll().flatten()
-            }
-            categoryResults + fetchLikedSimilarShorts()
-        } else {
-            raw.shuffled().take(6).map { sub ->
-                async(Dispatchers.IO) {
-                    runCatching {
-                        shortsService.fetchChannelShorts(sub.channelId, sub.name).map { it.item }
-                    }.getOrDefault(emptyList())
-                }
-            }.awaitAll().flatten()
-        }
+        val candidates = recommendationEngine.fetchNextShorts(
+            existingIds = emptySet(),
+            lastChannelId = null,
+            count = 8,
+            settings = settings,
+            visitorData = visitorData
+        )
 
-        val filtered = filterRepeats(candidates, settings.seenShortsTimestamps, settings.repeatCooldown)
+        return filterRepeats(candidates, settings.seenShortsTimestamps, settings.repeatCooldown)
             .filter { isAllowedShort(it, settings) }
             .distinctBy { it.id }
-        recommendationEngine.rankCandidates(filtered).take(8)
+    }
+
+    private suspend fun fetchTwoHopShortsBatch(batchSize: Int): List<ShortItem> {
+        val settings = userSettings.value
+        val existing = _shorts.value.mapTo(HashSet()) { it.id }
+        val lastChannel = _shorts.value.lastOrNull()?.channelId
+        val candidates = recommendationEngine.fetchNextShorts(
+            existingIds = existing,
+            lastChannelId = lastChannel,
+            count = batchSize,
+            settings = settings,
+            visitorData = visitorData
+        )
+
+        return filterRepeats(candidates, settings.seenShortsTimestamps, settings.repeatCooldown)
+            .filter { isAllowedShort(it, settings) }
+            .distinctBy { it.id }
     }
 
     fun loadMoreShorts() {
@@ -443,89 +460,30 @@ class ShortsViewModel(
             .distinctBy { it.id }
     }
 
-    private suspend fun fetchCombinedShortsBatch(): List<ShortItem> = coroutineScope {
-        val allSubs = subscriptionDao.getAllOnce()
+    private suspend fun fetchCombinedShortsBatch(): List<ShortItem> {
         val settings = userSettings.value
-        val seenMap = settings.seenShortsTimestamps
-        val cooldown = settings.repeatCooldown
+        val currentList = _shorts.value
+        val existingIds = currentList.mapTo(HashSet()) { it.id }
 
-        if (allSubs.isEmpty()) {
-            // Strict source policy: no subscriptions means only selected categories and liked-similar.
-            val categoryShorts = if (settings.selectedCategoryIds.isNotEmpty()) fetchCategoryBatch() else emptyList()
-            val likedSimilar = fetchLikedSimilarShorts()
-            return@coroutineScope (categoryShorts + likedSimilar)
+        val candidates = fetchTwoHopShortsBatch(batchSize = 20)
+            .let { list ->
+                filterRepeats(list, settings.seenShortsTimestamps, settings.repeatCooldown)
+                    .filter { isAllowedShort(it, settings) }
+                    .distinctBy { it.id }
+            }
+
+        // When the recommendation pool has nothing left to serve (thin subscriptions, no likes,
+        // no categories), supplement from category picks and thumbs-up-similar so paging keeps
+        // filling instead of dead-ending the Shorts feed after the first batch.
+        return if (candidates.isEmpty()) {
+            (fetchCategoryBatch() + fetchLikedSimilarShorts())
+                .filter { it.id !in existingIds }
                 .filter { isAllowedShort(it, settings) }
                 .distinctBy { it.id }
-                .shuffled()
-                .take(20)
-        }
-
-        // 1. Sample subscribed channels in parallel for their latest Shorts.
-        val sampledSubs = allSubs.shuffled().take(12)
-        val subResultsByChannel = sampledSubs.map { sub ->
-            async {
-                sub to shortsService.fetchChannelShorts(sub.channelId, sub.name)
-                    .sortedByDescending { it.publishedIso }
-                    .map { it.item }
-            }
-        }.awaitAll()
-
-        val directSubShorts = subResultsByChannel
-            .flatMap { it.second }
-            .filter { isAllowedShort(it, settings) }
-
-        // 2. Shorts from similar channels, selected categories, and thumbs-up-similar.
-        val channelsWithSeeds = subResultsByChannel.filter { it.second.isNotEmpty() }.shuffled().take(4)
-        val similarShorts = (fetchSimilarChannelBatch(allSubs, channelsWithSeeds, visitorData) +
-            fetchLikedSimilarShorts())
-            .filter { isAllowedShort(it, settings) }
-            .distinctBy { it.id }
-            .shuffled()
-        val categoryShorts = if (settings.selectedCategoryIds.isNotEmpty()) {
-            fetchCategoryBatch()
+                .toList()
         } else {
-            emptyList()
+            candidates
         }
-
-        // 3. Apply repeat cooldown and dedupe across sources.
-        val freshSubShorts = filterRepeats(directSubShorts, seenMap, cooldown)
-            .filter { isAllowedShort(it, settings) }
-            .distinctBy { it.id }
-            .shuffled()
-
-        val subVideoIds = freshSubShorts.mapTo(HashSet()) { it.id }
-        val likedChannels = settings.likedShortChannelIds
-        val freshSimilarShorts = filterRepeats(similarShorts, seenMap, cooldown)
-            .filterNot { it.id in subVideoIds }
-            .filter { isAllowedShort(it, settings) }
-            .distinctBy { it.id }
-            .shuffled()
-            // Stable sort within the shuffled list: channels the user liked rank first.
-            .sortedByDescending { it.channelId in likedChannels }
-
-        val usedIds = subVideoIds + freshSimilarShorts.mapTo(HashSet()) { it.id }
-        val freshCategoryShorts = filterRepeats(categoryShorts, seenMap, cooldown)
-            .filterNot { it.id in usedIds }
-            .filter { isAllowedShort(it, settings) }
-            .distinctBy { it.id }
-            .shuffled()
-
-        // 4. Interleave 2 subscribed, 1 similar-channel, and 1 category Short.
-        val blended = buildList {
-            val subIter = freshSubShorts.iterator()
-            val simIter = freshSimilarShorts.iterator()
-            val catIter = freshCategoryShorts.iterator()
-            while (subIter.hasNext() || simIter.hasNext() || catIter.hasNext()) {
-                repeat(2) { if (subIter.hasNext()) add(subIter.next()) }
-                if (simIter.hasNext()) add(simIter.next())
-                if (catIter.hasNext()) add(catIter.next())
-            }
-        }
-
-        recommendationEngine.rankCandidates(blended)
-            .filter { isAllowedShort(it, settings) }
-            .distinctBy { it.id }
-            .take(20)
     }
 
     private suspend fun fetchCategoryBatch(): List<ShortItem> = coroutineScope {

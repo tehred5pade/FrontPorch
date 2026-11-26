@@ -45,7 +45,8 @@ fun SearchScreen(
         videoId: String,
         title: String,
         channelId: String,
-        channelTitle: String
+        channelTitle: String,
+        searchQuery: String
     ) -> Unit,
     onOpenChannel: (channelId: String, channelTitle: String) -> Unit,
     onToggleSubscribe: (channelId: String, channelTitle: String) -> Unit,

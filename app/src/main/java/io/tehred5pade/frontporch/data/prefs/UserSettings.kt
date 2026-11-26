@@ -1,13 +1,15 @@
 package io.tehred5pade.frontporch.data.prefs
 
 import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.preferencesDataStoreFile
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -111,7 +113,18 @@ private fun parseShortFeedback(raw: Set<String>): ParsedShortFeedback {
     )
 }
 
-private val Context.dataStore: androidx.datastore.core.DataStore<Preferences> by preferencesDataStore(name = "user_settings")
+object UserSettingsDataStore {
+    @Volatile
+    private var INSTANCE: DataStore<Preferences>? = null
+
+    fun getInstance(context: Context): DataStore<Preferences> {
+        return INSTANCE ?: synchronized(this) {
+            INSTANCE ?: PreferenceDataStoreFactory.create(
+                produceFile = { context.applicationContext.preferencesDataStoreFile("user_settings") }
+            ).also { INSTANCE = it }
+        }
+    }
+}
 
 class UserSettingsRepository(private val context: Context) {
     private object PreferencesKeys {
@@ -144,7 +157,7 @@ class UserSettingsRepository(private val context: Context) {
         val SHORT_FEEDBACK = stringSetPreferencesKey("short_feedback")
     }
 
-    val settingsFlow: Flow<UserSettings> = context.dataStore.data.map { prefs ->
+    val settingsFlow: Flow<UserSettings> = UserSettingsDataStore.getInstance(context).data.map { prefs ->
         val cooldownName = prefs[PreferencesKeys.REPEAT_COOLDOWN] ?: ShortRepeatCooldown.SEVEN_DAYS.name
         val cooldown = runCatching { ShortRepeatCooldown.valueOf(cooldownName) }.getOrDefault(ShortRepeatCooldown.SEVEN_DAYS)
         val seenMap = (prefs[PreferencesKeys.SEEN_SHORTS] ?: emptySet()).mapNotNull { entry ->
@@ -189,11 +202,11 @@ class UserSettingsRepository(private val context: Context) {
     }
 
     suspend fun updatePlayerGesturesEnabled(enabled: Boolean) {
-        context.dataStore.edit { it[PreferencesKeys.PLAYER_GESTURES_ENABLED] = enabled }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.PLAYER_GESTURES_ENABLED] = enabled }
     }
 
     suspend fun updatePreferredAudioLanguage(languageCode: String) {
-        context.dataStore.edit { it[PreferencesKeys.PREFERRED_AUDIO_LANGUAGE] = languageCode }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.PREFERRED_AUDIO_LANGUAGE] = languageCode }
     }
 
     /**
@@ -201,7 +214,7 @@ class UserSettingsRepository(private val context: Context) {
      * an older preference cannot keep selecting high-res content after the toggle is disabled.
      */
     suspend fun updateAllowHighResContent(enabled: Boolean) {
-        context.dataStore.edit { prefs ->
+        UserSettingsDataStore.getInstance(context).edit { prefs ->
             prefs[PreferencesKeys.ALLOW_HIGH_RES_CONTENT] = enabled
             prefs[PreferencesKeys.ALLOW_HIGH_RES_DOWNLOADS_LEGACY] = enabled
             if (!enabled) {
@@ -218,57 +231,57 @@ class UserSettingsRepository(private val context: Context) {
     }
 
     suspend fun updateWifiStreamHeight(height: Int) {
-        context.dataStore.edit { it[PreferencesKeys.WIFI_STREAM_HEIGHT] = height }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.WIFI_STREAM_HEIGHT] = height }
     }
 
     suspend fun updateMobileStreamHeight(height: Int) {
-        context.dataStore.edit { it[PreferencesKeys.MOBILE_STREAM_HEIGHT] = height }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.MOBILE_STREAM_HEIGHT] = height }
     }
 
     suspend fun updateWifiStreamTargetFps(fps: Int) {
-        context.dataStore.edit { it[PreferencesKeys.WIFI_STREAM_FPS] = fps }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.WIFI_STREAM_FPS] = fps }
     }
 
     suspend fun updateMobileStreamTargetFps(fps: Int) {
-        context.dataStore.edit { it[PreferencesKeys.MOBILE_STREAM_FPS] = fps }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.MOBILE_STREAM_FPS] = fps }
     }
 
     suspend fun updateWifiDownloadHeight(height: Int) {
-        context.dataStore.edit { it[PreferencesKeys.WIFI_DOWNLOAD_HEIGHT] = height }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.WIFI_DOWNLOAD_HEIGHT] = height }
     }
 
     suspend fun updateWifiDownloadTargetFps(fps: Int) {
-        context.dataStore.edit { it[PreferencesKeys.WIFI_DOWNLOAD_FPS] = fps }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.WIFI_DOWNLOAD_FPS] = fps }
     }
 
     suspend fun updateMobileDownloadHeight(height: Int) {
-        context.dataStore.edit { it[PreferencesKeys.MOBILE_DOWNLOAD_HEIGHT] = height }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.MOBILE_DOWNLOAD_HEIGHT] = height }
     }
 
     suspend fun updateMobileDownloadTargetFps(fps: Int) {
-        context.dataStore.edit { it[PreferencesKeys.MOBILE_DOWNLOAD_FPS] = fps }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.MOBILE_DOWNLOAD_FPS] = fps }
     }
 
     suspend fun updateSponsorBlock(enabled: Boolean) {
-        context.dataStore.edit { it[PreferencesKeys.SPONSOR_BLOCK_ENABLED] = enabled }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.SPONSOR_BLOCK_ENABLED] = enabled }
     }
 
     suspend fun updateSelectedCategories(categoryIds: Set<String>) {
-        context.dataStore.edit { it[PreferencesKeys.SELECTED_CATEGORIES] = categoryIds }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.SELECTED_CATEGORIES] = categoryIds }
     }
 
     suspend fun updateCustomCategories(customs: Set<String>) {
-        context.dataStore.edit { it[PreferencesKeys.CUSTOM_CATEGORIES] = customs }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.CUSTOM_CATEGORIES] = customs }
     }
 
     suspend fun updateRepeatCooldown(cooldown: ShortRepeatCooldown) {
-        context.dataStore.edit { it[PreferencesKeys.REPEAT_COOLDOWN] = cooldown.name }
+        UserSettingsDataStore.getInstance(context).edit { it[PreferencesKeys.REPEAT_COOLDOWN] = cooldown.name }
     }
 
     suspend fun recordShortViewed(videoId: String) {
         val now = System.currentTimeMillis()
         val cutoff = now - (60L * 24 * 60 * 60 * 1000) // Keep 60 days of history
-        context.dataStore.edit { prefs ->
+        UserSettingsDataStore.getInstance(context).edit { prefs ->
             val existing = (prefs[PreferencesKeys.SEEN_SHORTS] ?: emptySet())
                 .filter { entry ->
                     val ts = entry.substringAfter(":", "0").toLongOrNull() ?: 0L
@@ -283,7 +296,7 @@ class UserSettingsRepository(private val context: Context) {
 
     /** Records a like/dislike, replacing any previous feedback for the same Short. */
     suspend fun setShortFeedback(videoId: String, channelId: String, liked: Boolean) {
-        context.dataStore.edit { prefs ->
+        UserSettingsDataStore.getInstance(context).edit { prefs ->
             val existing = (prefs[PreferencesKeys.SHORT_FEEDBACK] ?: emptySet()).toMutableSet()
             existing.removeAll { it.startsWith("$videoId|") }
             existing.add("$videoId|$channelId|${if (liked) "L" else "D"}")
@@ -292,14 +305,14 @@ class UserSettingsRepository(private val context: Context) {
     }
 
     suspend fun clearShortFeedback(videoId: String) {
-        context.dataStore.edit { prefs ->
+        UserSettingsDataStore.getInstance(context).edit { prefs ->
             prefs[PreferencesKeys.SHORT_FEEDBACK] = (prefs[PreferencesKeys.SHORT_FEEDBACK] ?: emptySet())
                 .filterNot { it.startsWith("$videoId|") }.toSet()
         }
     }
 
     suspend fun updateDownloadUris(videoUri: String?, audioUri: String?) {
-        context.dataStore.edit { prefs ->
+        UserSettingsDataStore.getInstance(context).edit { prefs ->
             if (videoUri != null) prefs[PreferencesKeys.VIDEO_DOWNLOAD_URI] = videoUri
             if (audioUri != null) prefs[PreferencesKeys.AUDIO_DOWNLOAD_URI] = audioUri
         }

@@ -121,6 +121,7 @@ import io.tehred5pade.frontporch.ui.player.KeepScreenOnEffect
 import io.tehred5pade.frontporch.ui.player.PlayerGestureOverlay
 import io.tehred5pade.frontporch.ui.player.SegmentedDotScrubber
 import io.tehred5pade.frontporch.ui.playlist.PlaylistDialog
+import io.tehred5pade.frontporch.util.resolveDownloadedMediaUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -966,8 +967,7 @@ fun OfflineVideoPlayer(
     KeepScreenOnEffect(keepScreenOn = isPlaying)
 
     LaunchedEffect(currentVideo.videoId) {
-        val fileUri = runCatching { Uri.parse(currentVideo.localVideoPath) }.getOrNull()
-            ?: Uri.fromFile(File(currentVideo.localVideoPath))
+        val fileUri = resolveDownloadedMediaUri(currentVideo.localVideoPath)
         exoPlayer.setMediaItem(MediaItem.fromUri(fileUri))
         exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
         exoPlayer.prepare()

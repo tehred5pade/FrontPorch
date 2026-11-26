@@ -14,6 +14,9 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import io.tehred5pade.frontporch.data.db.SubscriptionDao
 import io.tehred5pade.frontporch.data.db.SubscriptionEntity
+import io.tehred5pade.frontporch.shorts.PoolChannelEntity
+import io.tehred5pade.frontporch.shorts.SeenShortEntity as ShortsSeenShortEntity
+import io.tehred5pade.frontporch.shorts.TwoHopShortsDao
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "watch_history")
@@ -89,9 +92,11 @@ interface DownloadsDao {
         ChannelAffinityEntity::class,
         TagAffinityEntity::class,
         SeenShortEntity::class,
-        AffinityScoreEntity::class
+        AffinityScoreEntity::class,
+        PoolChannelEntity::class,
+        ShortsSeenShortEntity::class
     ],
-    version = 9,
+    version = 10,
     exportSchema = false
 )
 abstract class FrontPorchDatabase : RoomDatabase() {
@@ -101,6 +106,7 @@ abstract class FrontPorchDatabase : RoomDatabase() {
     abstract fun downloadedVideoDao(): DownloadedVideoDao
     abstract fun cachedFeedVideoDao(): CachedFeedVideoDao
     abstract fun recommendationDao(): RecommendationDao
+    abstract fun twoHopShortsDao(): TwoHopShortsDao
 
     companion object {
         @Volatile
@@ -235,6 +241,37 @@ abstract class FrontPorchDatabase : RoomDatabase() {
             }
         }
 
+        /** Adds the Shorts discovery pool (weighted channel selection) and the channel-scoped
+         *  seen-shorts table used by the TwoHop Shorts engine. */
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `shorts_pool_channels` (
+                        `channelUrl` TEXT NOT NULL,
+                        `channelName` TEXT NOT NULL,
+                        `sourceTier` INTEGER NOT NULL,
+                        `discoveredViaChannelUrl` TEXT,
+                        `poolWeight` REAL NOT NULL,
+                        `dislikeCount` INTEGER NOT NULL DEFAULT 0,
+                        `lastFetchedMs` INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(`channelUrl`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `shorts_seen` (
+                        `videoId` TEXT NOT NULL,
+                        `channelUrl` TEXT NOT NULL,
+                        `seenAtMs` INTEGER NOT NULL,
+                        PRIMARY KEY(`videoId`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getDatabase(context: Context): FrontPorchDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -242,7 +279,7 @@ abstract class FrontPorchDatabase : RoomDatabase() {
                     FrontPorchDatabase::class.java,
                     "front_porch_database"
                 )
-                .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_8_9)
+                .addMigrations(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_8_9, MIGRATION_9_10)
                 .fallbackToDestructiveMigration()
                 .build()
                 INSTANCE = instance

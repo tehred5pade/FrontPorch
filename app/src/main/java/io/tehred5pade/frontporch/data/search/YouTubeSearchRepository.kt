@@ -70,6 +70,12 @@ class YouTubeSearchRepository(private val okHttpClient: OkHttpClient) {
         val trimmed = query.trim()
         if (trimmed.isEmpty()) return@withContext SearchPage(emptyList(), null)
 
+        val effectiveQuery = if (filter == SearchFilter.SHORTS && !trimmed.contains("shorts", ignoreCase = true)) {
+            "$trimmed #shorts"
+        } else {
+            trimmed
+        }
+
         // Relevance keeps the category filter's spParam. Explicit sort params replace it,
         // matching YouTube's own ordering requests.
         val effectiveParams = if (sort == SearchSort.RELEVANCE) {
@@ -79,7 +85,7 @@ class YouTubeSearchRepository(private val okHttpClient: OkHttpClient) {
         }
 
         val payload = JSONObject().apply {
-            put("query", trimmed)
+            put("query", effectiveQuery)
             effectiveParams?.let { put("params", it) }
             put("context", buildClientContext())
         }
@@ -217,7 +223,20 @@ class YouTubeSearchRepository(private val okHttpClient: OkHttpClient) {
                 val nextToken = findContinuationToken(root)
 
                 val filtered = when (filter) {
-                    SearchFilter.SHORTS -> rawResults.filterIsInstance<YouTubeSearchResult.Short>()
+                    SearchFilter.SHORTS -> rawResults.mapNotNull { result ->
+                        when (result) {
+                            is YouTubeSearchResult.Short -> result
+                            is YouTubeSearchResult.Video -> YouTubeSearchResult.Short(
+                                id = result.id,
+                                title = result.title,
+                                viewsText = result.metaText,
+                                thumbnailUrl = "https://i.ytimg.com/vi/${result.id}/hqdefault.jpg",
+                                channelTitle = result.channelName,
+                                channelId = result.channelId
+                            )
+                            is YouTubeSearchResult.Channel -> null
+                        }
+                    }
                     SearchFilter.VIDEOS -> rawResults.filterIsInstance<YouTubeSearchResult.Video>()
                     SearchFilter.CHANNELS -> rawResults.filterIsInstance<YouTubeSearchResult.Channel>()
                     SearchFilter.ALL -> rawResults
@@ -234,15 +253,19 @@ class YouTubeSearchRepository(private val okHttpClient: OkHttpClient) {
         seenIds: MutableSet<String>
     ) {
         for (i in 0 until sections.length()) {
-            val items = sections.optJSONObject(i)
-                ?.optJSONObject("itemSectionRenderer")
-                ?.optJSONArray("contents") ?: continue
+            parseNodeRecursive(sections.opt(i), out, seenIds)
+        }
+    }
 
-            for (j in 0 until items.length()) {
-                val entry = items.optJSONObject(j) ?: continue
-
-                // 1. Standard videos (and shorts surfaced as videoRenderer)
-                entry.optJSONObject("videoRenderer")?.let { vr ->
+    private fun parseNodeRecursive(
+        node: Any?,
+        out: MutableList<YouTubeSearchResult>,
+        seenIds: MutableSet<String>
+    ) {
+        when (node) {
+            is JSONObject -> {
+                // 1. videoRenderer
+                node.optJSONObject("videoRenderer")?.let { vr ->
                     parseVideo(vr)?.let { parsed ->
                         val key = when (parsed) {
                             is YouTubeSearchResult.Video -> "v_${parsed.id}"
@@ -253,32 +276,87 @@ class YouTubeSearchRepository(private val okHttpClient: OkHttpClient) {
                     }
                 }
 
-                // 2. Channels
-                entry.optJSONObject("channelRenderer")?.let { cr ->
+                // 2. channelRenderer
+                node.optJSONObject("channelRenderer")?.let { cr ->
                     parseChannel(cr)?.let { parsed ->
                         if (seenIds.add("c_${parsed.id}")) out.add(parsed)
                     }
                 }
 
-                // 3. Shorts shelves (legacy reelShelfRenderer and newer gridShelfViewModel)
-                val shelfItems = entry.optJSONObject("reelShelfRenderer")?.optJSONArray("items")
-                    ?: entry.optJSONObject("gridShelfViewModel")
-                        ?.optJSONObject("contents")
-                        ?.optJSONArray("items")
-
-                if (shelfItems != null) {
-                    for (k in 0 until shelfItems.length()) {
-                        parseShortEntry(shelfItems.optJSONObject(k))?.let { parsed ->
-                            if (seenIds.add("s_${parsed.id}")) out.add(parsed)
-                        }
+                // 3. reelItemRenderer
+                node.optJSONObject("reelItemRenderer")?.let { rir ->
+                    parseShortEntry(JSONObject().put("reelItemRenderer", rir))?.let { parsed ->
+                        if (seenIds.add("s_${parsed.id}")) out.add(parsed)
                     }
                 }
 
-                // 4. Shorts lockups returned directly in the item section
-                parseShortEntry(entry)?.let { parsed ->
-                    if (seenIds.add("s_${parsed.id}")) out.add(parsed)
+                // 4. shortsLockupViewModel
+                node.optJSONObject("shortsLockupViewModel")?.let { slv ->
+                    parseShortEntry(JSONObject().put("shortsLockupViewModel", slv))?.let { parsed ->
+                        if (seenIds.add("s_${parsed.id}")) out.add(parsed)
+                    }
+                }
+
+                // 5. lockupViewModel
+                node.optJSONObject("lockupViewModel")?.let { lvm ->
+                    parseLockupViewModel(lvm)?.let { parsed ->
+                        val key = when (parsed) {
+                            is YouTubeSearchResult.Video -> "v_${parsed.id}"
+                            is YouTubeSearchResult.Short -> "s_${parsed.id}"
+                            is YouTubeSearchResult.Channel -> "c_${parsed.id}"
+                        }
+                        if (seenIds.add(key)) out.add(parsed)
+                    }
+                }
+
+                val keys = node.keys()
+                while (keys.hasNext()) {
+                    parseNodeRecursive(node.opt(keys.next()), out, seenIds)
                 }
             }
+            is JSONArray -> {
+                for (j in 0 until node.length()) {
+                    parseNodeRecursive(node.opt(j), out, seenIds)
+                }
+            }
+        }
+    }
+
+    private fun parseLockupViewModel(lvm: JSONObject): YouTubeSearchResult? {
+        val lvmStr = lvm.toString()
+        val rawId = lvm.optString("contentId").takeIf { it.isNotBlank() }
+            ?: lvm.optJSONObject("contentId")?.optString("videoId")
+            ?: Regex(""""videoId"\s*:\s*"([^"]+)"""").find(lvmStr)?.groupValues?.getOrNull(1)
+        val contentId = rawId.orEmpty()
+        if (contentId.isBlank()) return null
+
+        val metadata = lvm.optJSONObject("metadata")?.optJSONObject("lockupMetadataViewModel")
+        val title = metadata?.optJSONObject("title")?.optString("content")
+            ?: readText(metadata?.optJSONObject("title"))
+        val subtitle = metadata?.optJSONObject("subtitle")?.optString("content")
+            ?: readText(metadata?.optJSONObject("subtitle"))
+
+        val isShort = lvmStr.contains("reelWatchEndpoint") ||
+            lvmStr.contains("SHORTS", ignoreCase = true) ||
+            contentId.startsWith("shorts") ||
+            title.contains("#shorts", ignoreCase = true)
+
+        return if (isShort) {
+            YouTubeSearchResult.Short(
+                id = contentId,
+                title = title,
+                viewsText = subtitle,
+                thumbnailUrl = "https://i.ytimg.com/vi/$contentId/hqdefault.jpg"
+            )
+        } else {
+            YouTubeSearchResult.Video(
+                id = contentId,
+                title = title,
+                channelName = subtitle,
+                channelId = "",
+                durationText = "",
+                metaText = ""
+            )
         }
     }
 

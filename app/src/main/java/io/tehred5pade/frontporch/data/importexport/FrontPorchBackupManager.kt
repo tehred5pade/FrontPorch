@@ -9,7 +9,6 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
 import io.tehred5pade.frontporch.data.db.SubscriptionDao
 import io.tehred5pade.frontporch.data.db.SubscriptionEntity
 import io.tehred5pade.frontporch.data.local.AffinityScoreEntity
@@ -19,13 +18,13 @@ import io.tehred5pade.frontporch.data.local.SeenShortEntity
 import io.tehred5pade.frontporch.data.local.ShortFeedbackEntity
 import io.tehred5pade.frontporch.data.local.TagAffinityEntity
 import io.tehred5pade.frontporch.data.playlist.PlaylistStore
+import io.tehred5pade.frontporch.data.prefs.UserSettingsDataStore
+import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-
-private val Context.backupDataStore by preferencesDataStore(name = "user_settings")
 
 data class ImportSummary(
     val channelsImported: Int,
@@ -48,7 +47,7 @@ object FrontPorchBackupManager {
 
         // 1. Settings (DataStore & SharedPreferences with typed values)
         val settingsObj = JSONObject()
-        val dataStorePrefs = context.backupDataStore.data.first()
+        val dataStorePrefs = UserSettingsDataStore.getInstance(context).data.first()
         val dsMap = JSONObject()
         dataStorePrefs.asMap().forEach { (key, value) ->
             if (value != null) {
@@ -76,7 +75,8 @@ object FrontPorchBackupManager {
             "frontporch_download_prefs",
             "frontporch_sponsorblock_prefs",
             "frontporch_theme_prefs",
-            "frontporch_download_settings"
+            "frontporch_download_settings",
+            "frontporch_updater_prefs"
         )
         val spObj = JSONObject()
         for (name in prefsNames) {
@@ -250,7 +250,7 @@ object FrontPorchBackupManager {
             if (settingsObj != null) {
                 val dsMap = settingsObj.optJSONObject("user_settings")
                 if (dsMap != null) {
-                    context.backupDataStore.edit { prefs ->
+                    UserSettingsDataStore.getInstance(context).edit { prefs ->
                         val keys = dsMap.keys()
                         while (keys.hasNext()) {
                             val keyName = keys.next()
@@ -339,6 +339,7 @@ object FrontPorchBackupManager {
                         }
                         editor.apply()
                     }
+                    SponsorBlockPreferences.init(context)
                 }
                 settingsRestored = true
             }

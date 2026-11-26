@@ -524,9 +524,12 @@ fun FeedScreen(
             ) {
                 when {
                     videos.isEmpty() && isRefreshing -> {
-                        // The pinned search bar carries the launch-loading animation,
-                        // so keep this area clear while the first batch arrives.
-                        Box(modifier = Modifier.fillMaxSize())
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        }
                     }
                     videos.isEmpty() -> {
                         Box(

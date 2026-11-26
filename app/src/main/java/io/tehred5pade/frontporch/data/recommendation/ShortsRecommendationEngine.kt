@@ -9,7 +9,9 @@ import io.tehred5pade.frontporch.data.local.SeenShortEntity
 import io.tehred5pade.frontporch.data.local.ShortFeedbackEntity
 import io.tehred5pade.frontporch.data.model.ShortsCategoryItem
 import io.tehred5pade.frontporch.data.prefs.UserSettings
+import io.tehred5pade.frontporch.data.search.SearchFilter
 import io.tehred5pade.frontporch.data.search.YouTubeSearchRepository
+import io.tehred5pade.frontporch.data.search.YouTubeSearchResult
 import io.tehred5pade.frontporch.data.util.ShortsLanguageFilter
 import io.tehred5pade.frontporch.data.util.SlopAndClickbaitFilter
 import io.tehred5pade.frontporch.ui.models.ShortItem
@@ -38,7 +40,9 @@ import kotlin.random.Random
  * Every candidate is filtered for valid short-form duration, English-only (when requested),
  * placeholder creators, slop/clickbait, muted channels and the seen history before ranking.
  * Ranking is `channelScore + sum(keywordScores) + jitter`, then a creator-bucketed rotation
- * prevents two items from the same creator appearing back-to-back.
+ * prevents two items from the same creator appearing back-to-back, and a topic guard prevents
+ * the same subject from being served twice in a row even when the creators differ. That keeps
+ * liked niches (cars, cooking, ...) flowing while the feed still rotates away from repeats.
  */
 class ShortsRecommendationEngine(
     private val recommendationDao: RecommendationDao,
@@ -47,17 +51,17 @@ class ShortsRecommendationEngine(
     private val searchRepository: YouTubeSearchRepository? = null
 ) {
     companion object {
-        const val CHANNEL_LIKE_DELTA = 5.0
+        const val CHANNEL_LIKE_DELTA = 15.0
         const val CHANNEL_DISLIKE_DELTA = -10.0
-        const val KEYWORD_LIKE_DELTA = 2.0
+        const val KEYWORD_LIKE_DELTA = 5.0
         const val KEYWORD_DISLIKE_DELTA = -3.0
-        const val IMPLICIT_COMPLETE_CHANNEL_DELTA = 2.0
+        const val IMPLICIT_COMPLETE_CHANNEL_DELTA = 4.0
         const val IMPLICIT_SWIPE_CHANNEL_DELTA = -1.5
         const val IMPLICIT_SWIPE_KEYWORD_DELTA = -0.5
-        const val SUBSCRIPTION_BASELINE = 4.0
+        const val SUBSCRIPTION_BASELINE = 1.0
 
         /** Small positive prior for channels found outside the subscription list. */
-        const val DISCOVERY_BASELINE = 2.0
+        const val DISCOVERY_BASELINE = 8.0
 
         const val CHANNEL_MUTE_SCORE = -15.0
         const val CHANNEL_MUTE_DISLIKES = 2
@@ -79,8 +83,15 @@ class ShortsRecommendationEngine(
         private const val CHANNEL_SAMPLE_SIZE = 12
         private const val CHANNEL_PASSES_PER_FETCH = 4
 
-        /** Reserve part of every channel batch for unsubscribed creators once discovered. */
-        private const val DISCOVERY_SAMPLE_QUOTA = 4
+        /** Fresh topics get a small exploration nudge; heavily repeated topics get pushed down. */
+        private const val TOPIC_EXPLORATION_BONUS = 2.0
+        private const val TOPIC_REPEAT_PENALTY = -3.0
+        private const val TOPIC_REPEAT_SERIES = 2
+        /** Bonus for serving a Short from a liked topic other than the one just served. */
+        private const val LIKED_TOPIC_ROTATION_DELTA = 4.0
+        /** Strong push-down for Shorts whose topic the user has actively disliked. */
+        private const val DISLIKED_TOPIC_PENALTY = -6.0
+
         private const val MAX_DISCOVERED_CHANNELS = 200
         private const val MIN_DISCOVERY_CHANNELS = 8
 
@@ -95,7 +106,7 @@ class ShortsRecommendationEngine(
         private const val SEEN_RETENTION_MS = 90L * 24 * 60 * 60 * 1000
 
         /** Cap how many queued Shorts can come from one creator so the pool stays diverse. */
-        private const val MAX_POOL_ITEMS_PER_CHANNEL = 8
+        private const val MAX_POOL_ITEMS_PER_CHANNEL = 2
 
         /** Channels that returned no Shorts are skipped for a while instead of eating samples. */
         private const val DRY_CHANNEL_RETRY_MS = 15L * 60 * 1000
@@ -149,6 +160,29 @@ class ShortsRecommendationEngine(
      */
     private val discoveredChannels = LinkedHashMap<String, String>()
     private val expandedDiscoverySeeds = HashSet<String>()
+
+    /**
+     * Topics the user has actively disliked this session; Shorts from these topics are pushed
+     * down in scoring so disliked content stops crowding out liked categories.
+     */
+    private val dislikedTopics = HashSet<String>()
+
+    /**
+     * Topics with positive affinity (user likes) currently in scope for feed rotation. Items
+     * from these topics — other than the one just served — get a rotation bonus so the feed
+     * cycles through what the user likes instead of collapsing back onto a single niche.
+     */
+    private var likedTopicSet = emptySet<String>()
+
+    /** Topic -> number of times served this session; drives topic exploration/rotation. */
+    private val servedTopicCounts = HashMap<String, Int>()
+
+    /**
+     * Topic (best keyword token) of the most recently served Short. Drives the topic guard in
+     * [orderWithCreatorSpacing] so consecutive Shorts never repeat the same subject, even when
+     * they come from different creators. Guarded by [poolMutex] while the pool is being mutated.
+     */
+    private var lastServedTopic: String? = null
 
     // ---------------------------------------------------------------------------------------
     // Cold start
@@ -292,6 +326,13 @@ class ShortsRecommendationEngine(
                     dislikeDelta = 0,
                     now = now
                 )
+                // Track disliked topics explicitly so disliked content is pushed out of the
+                // feed once enough users (here: the user) have steered away from it.
+                if (keywordDelta * sign < 0.0) {
+                    dislikedTopics.add(tag)
+                } else if (keywordDelta * sign > 0.0) {
+                    dislikedTopics.remove(tag)
+                }
             }
         }
     }
@@ -351,33 +392,24 @@ class ShortsRecommendationEngine(
             val explicitlyDisliked =
                 recommendationDao.getFeedback(short.id)?.feedbackType == FEEDBACK_DISLIKE
 
-            when {
-                explicitlyDisliked -> Unit
-                completionPercent >= WATCH_COMPLETE_PERCENT -> {
-                    applyImplicitDelta(
-                        short,
-                        channelDelta = IMPLICIT_COMPLETE_CHANNEL_DELTA,
-                        keywordDelta = 0.0
-                    )
-                    enqueueRelatedSeed(short.id)
-                }
-                watchedMs in 1L until QUICK_SWIPE_MS -> {
-                    applyImplicitDelta(
-                        short,
-                        channelDelta = IMPLICIT_SWIPE_CHANNEL_DELTA,
-                        keywordDelta = IMPLICIT_SWIPE_KEYWORD_DELTA
-                    )
-                }
+            // Views do not count unless the whole short is watched (>= WATCH_COMPLETE_PERCENT).
+            if (!explicitlyDisliked && completionPercent >= WATCH_COMPLETE_PERCENT) {
+                applyImplicitDelta(
+                    short,
+                    channelDelta = IMPLICIT_COMPLETE_CHANNEL_DELTA,
+                    keywordDelta = 2.0
+                )
+                enqueueRelatedSeed(short.id)
             }
 
-            // Neutral watches still mark the signal consumed so the same video cannot be
-            // penalized/rewarded twice if it is re-opened from search.
+            // Neutral/partial watches still mark the signal consumed so the same video cannot be
+            // rewarded twice if it is re-opened from search.
             recommendationDao.insertSeen(
                 SeenShortEntity(
                     videoId = short.id,
                     timestamp = System.currentTimeMillis(),
                     completionPercent = completion,
-                    implicitApplied = true
+                    implicitApplied = completionPercent >= WATCH_COMPLETE_PERCENT
                 )
             )
             recommendationDao.pruneSeenOlderThan(System.currentTimeMillis() - SEEN_RETENTION_MS)
@@ -546,16 +578,33 @@ class ShortsRecommendationEngine(
             }
 
             val affinities = loadAffinityMap()
+            likedTopicSet = affinities.values
+                .filter { it.type == TYPE_TAG && it.score > 0.0 }
+                .take(6)
+                .map { it.affinityKey.removePrefix(TAG_PREFIX) }
+                .filter { it.isNotBlank() }
+                .toHashSet()
             val scored = candidatePool.asSequence()
                 .filterNot { it.id in existingIds || it.id in seenIds }
                 .filterNot { isExcluded(it, settings, mutedChannels) }
                 .map { ScoredShort(it, scoreShort(it, affinities)) }
                 .toList()
 
-            val ordered = orderWithCreatorSpacing(scored, lastChannelId).take(count)
+            val ordered = orderWithCreatorSpacing(
+                scored,
+                lastChannelId,
+                avoidTopic = lastServedTopic,
+                affinities = affinities
+            ).take(count)
             if (ordered.isNotEmpty()) {
                 val handedOut = ordered.mapTo(HashSet()) { it.id }
                 candidatePool.removeAll { it.id in handedOut }
+                // Rotate away from the tail topic served last time so the next page opens on a
+                // different subject instead of replaying the same niche.
+                lastServedTopic = ordered.last().let { topicFor(it, affinities) }.ifBlank { lastServedTopic }
+            }
+            ordered.forEach { item ->
+                rememberServedTopic(topicFor(item, affinities))
             }
             ordered
         }
@@ -581,7 +630,9 @@ class ShortsRecommendationEngine(
         }
         orderWithCreatorSpacing(
             filtered.map { ScoredShort(it, scoreShort(it, affinities)) },
-            firstChannelId
+            firstChannelId,
+            avoidTopic = lastServedTopic,
+            affinities = affinities
         )
     }
 
@@ -592,7 +643,98 @@ class ShortsRecommendationEngine(
         seenIds: Set<String>,
         target: Int
     ) {
-        // 1. Related chains from recent Like / 85%+ watch signals.
+        val subscriptions = runCatching { subscriptionDao.getAllOnce() }
+            .getOrDefault(emptyList())
+        val subscribedIds = subscriptions.mapTo(HashSet()) { it.channelId }
+        val subscribedChannels = subscriptions.map {
+            CandidateChannel(it.channelId, it.name, subscribed = true)
+        }
+        val blockedChannels = mutedChannels + settings.blockedShortChannelIds
+
+        val affinities = loadAffinityMap()
+        val topTags = affinities.values
+            .filter { it.type == TYPE_TAG && it.score > 0.0 }
+            .sortedByDescending { it.score }
+            .take(5)
+            .map { it.affinityKey.removePrefix(TAG_PREFIX) }
+
+        // 0. Active Discovery: Search YouTube for non-subscribed channels in user's liked niches
+        val discoveredChannelsNow = discoveredChannelCandidates(subscribedIds, affinities)
+        val repo = searchRepository
+        if (discoveredChannelsNow.size < 8 && repo != null && topTags.isNotEmpty()) {
+            val topTag = topTags.random(random)
+            val items: List<YouTubeSearchResult> = runCatching {
+                repo.searchFirstPage("$topTag shorts", SearchFilter.CHANNELS).items
+            }.getOrDefault(emptyList())
+            val channelSearchResults = items.filterIsInstance<YouTubeSearchResult.Channel>()
+            for (ch in channelSearchResults) {
+                if (ch.id.isNotBlank() && ch.id !in subscribedIds && !blockedChannels.contains(ch.id)) {
+                    discoveredChannels[ch.id] = ch.title
+                }
+            }
+        }
+
+        // 0.2. Discover channels related to or followed/recommended by the user's subscribed channels
+        if (subscriptions.isNotEmpty() && repo != null) {
+            val subSample = subscriptions.shuffled(random).take(2)
+            for (sub in subSample) {
+                val subChannelItems = runCatching {
+                    repo.searchFirstPage("${sub.name} recommended channels", SearchFilter.CHANNELS).items
+                }.getOrDefault(emptyList())
+                val subChannelResults = subChannelItems.filterIsInstance<YouTubeSearchResult.Channel>()
+                for (ch in subChannelResults) {
+                    if (ch.id.isNotBlank() && ch.id !in subscribedIds && !blockedChannels.contains(ch.id)) {
+                        discoveredChannels[ch.id] = ch.title
+                    }
+                }
+                val lookalikes = runCatching {
+                    shortsService.searchShortsByQuery(
+                        query = "${sub.name} #shorts",
+                        visitorData = visitorData,
+                        paramsOverride = null,
+                        preferredAudioLanguage = settings.preferredAudioLanguage
+                    ).getOrDefault(emptyList())
+                }.getOrDefault(emptyList())
+                if (lookalikes.isNotEmpty()) {
+                    val unsubscribedLookalikes = lookalikes.filter { it.channelId.isNotBlank() && it.channelId !in subscribedIds }
+                    if (unsubscribedLookalikes.isNotEmpty()) {
+                        addToPool(unsubscribedLookalikes, settings, mutedChannels, seenIds)
+                        rememberDiscoveredChannels(unsubscribedLookalikes)
+                    }
+                }
+            }
+        }
+
+        // 0.5. Fetch random discovery shorts from non-subscribed channels based on user's top liked tags
+        val searchQueries = (topTags + categorySeedQueries(settings)).distinct().shuffled(random).take(3)
+        for (query in searchQueries) {
+            val searchResults = runCatching {
+                shortsService.searchShortsByQuery(
+                    query = "$query #shorts",
+                    visitorData = visitorData,
+                    paramsOverride = null,
+                    preferredAudioLanguage = settings.preferredAudioLanguage
+                ).getOrDefault(emptyList())
+            }.getOrDefault(emptyList())
+            if (searchResults.isNotEmpty()) {
+                val unsubscribedResults = searchResults.filter { it.channelId.isBlank() || it.channelId !in subscribedIds }
+                if (unsubscribedResults.isNotEmpty()) {
+                    addToPool(unsubscribedResults, settings, mutedChannels, seenIds)
+                    rememberDiscoveredChannels(unsubscribedResults)
+                }
+            }
+        }
+
+        // 1. Related chains from recent Like / watch signals.
+        val likedFeedback = runCatching { recommendationDao.getAllFeedback() }
+            .getOrDefault(emptyList())
+            .filter { it.feedbackType == FEEDBACK_LIKE }
+            .map { it.videoId }
+            .takeLast(15)
+        for (likedId in likedFeedback) {
+            if (likedId.isNotBlank()) enqueueRelatedSeed(likedId)
+        }
+
         val seeds = takeRelatedSeeds(RELATED_EXPANSIONS_PER_FETCH)
         if (seeds.isNotEmpty()) {
             val related = coroutineScope {
@@ -603,14 +745,6 @@ class ShortsRecommendationEngine(
             addToPool(related, settings, mutedChannels, seenIds)
             rememberDiscoveredChannels(related)
         }
-
-        val subscriptions = runCatching { subscriptionDao.getAllOnce() }
-            .getOrDefault(emptyList())
-        val subscribedIds = subscriptions.mapTo(HashSet()) { it.channelId }
-        val subscribedChannels = subscriptions.map {
-            CandidateChannel(it.channelId, it.name, subscribed = true)
-        }
-        val blockedChannels = mutedChannels + settings.blockedShortChannelIds
 
         // 2. Weighted sampling of subscribed AND discovered channels. A discovered channel is
         //    fetched from its own Shorts tab with the same rotation, dry-channel skip and
@@ -733,13 +867,13 @@ class ShortsRecommendationEngine(
         val discoveredPool = discoveredAvailable.filterNot { it.channelId in recentlySampledSet }
 
         val picked = ArrayList<CandidateChannel>(minOf(limit, allAvailable.size))
-        val discoveryQuota = if (discoveredPool.isEmpty()) {
-            0
-        } else {
-            minOf(DISCOVERY_SAMPLE_QUOTA, limit)
-        }
+        val discoveryQuota = minOf(limit, discoveredPool.size)
         picked.addAll(weightedPick(discoveredPool, discoveryQuota, affinities))
-        picked.addAll(weightedPick(subscribedPool, limit - picked.size, affinities))
+
+        if (picked.size < limit) {
+            val subscriptionQuota = limit - picked.size
+            picked.addAll(weightedPick(subscribedPool, subscriptionQuota, affinities))
+        }
 
         // If one side ran dry, let the other fill the batch instead of under-fetching.
         if (picked.size < limit) {
@@ -947,7 +1081,30 @@ class ShortsRecommendationEngine(
             affinities[tagKey(tag)]?.score ?: 0.0
         }
         val jitter = random.nextDouble(-JITTER_RANGE, JITTER_RANGE)
-        return channelScore + keywordScore + jitter
+        // Topic exploration: a topic served for the first time this session gets a small nudge;
+        // topics served past the repeat threshold get pushed down so a single liked niche cannot
+        // monopolize the feed across many creators.
+        val itemTopic = topicFor(item, affinities)
+        val topicTerm = when {
+            itemTopic.isBlank() -> 0.0
+            itemTopic in dislikedTopics -> DISLIKED_TOPIC_PENALTY
+            else -> {
+                val servedCount = servedTopicCounts[itemTopic] ?: 0
+                when {
+                    servedCount == 0 -> TOPIC_EXPLORATION_BONUS
+                    servedCount < TOPIC_REPEAT_SERIES -> 0.0
+                    else -> TOPIC_REPEAT_PENALTY
+                }
+            }
+        }
+        // Liked-topic rotation: Shorts from liked topics other than the one just served get a
+        // bonus, so the feed cycles through what the user likes instead of latching on.
+        val likedTopicBonus = if (itemTopic in likedTopicSet && itemTopic != lastServedTopic) {
+            LIKED_TOPIC_ROTATION_DELTA
+        } else {
+            0.0
+        }
+        return channelScore + keywordScore + jitter + topicTerm + likedTopicBonus
     }
 
     /**
@@ -959,7 +1116,9 @@ class ShortsRecommendationEngine(
      */
     private fun orderWithCreatorSpacing(
         scored: List<ScoredShort>,
-        firstChannelId: String?
+        firstChannelId: String?,
+        avoidTopic: String? = null,
+        affinities: Map<String, AffinityScoreEntity> = emptyMap()
     ): List<ShortItem> {
         if (scored.isEmpty()) return emptyList()
 
@@ -974,11 +1133,36 @@ class ShortsRecommendationEngine(
         val rotation = buckets.keys.toMutableList()
         val ordered = ArrayList<ShortItem>(scored.size)
         var lastChannelId = firstChannelId?.takeIf { it.isNotBlank() }
+        var avoid = avoidTopic
 
         while (rotation.isNotEmpty()) {
-            val eligible = rotation.filter { key ->
+            var eligible = rotation.filter { key ->
                 key.startsWith("video:") || key != lastChannelId
             }.ifEmpty { rotation }
+
+            // Topic diversity: skip candidates from the same topic as the previously served
+            // Short (even when the creator differs) so the feed rotates subjects instead of
+            // replaying one niche like Harry Potter across several channels. Falls back to the
+            // full eligible set when every remaining candidate shares the avoided topic.
+            if (avoid != null) {
+                val topicFiltered = eligible.filter { key ->
+                    bucketTopTopic(buckets[key], affinities) != avoid
+                }
+                if (topicFiltered.isNotEmpty()) eligible = topicFiltered
+            }
+
+            // Topic rotation: once a topic has been served repeatedly this session it is
+            // skipped while any fresh-topic candidate is still available, so a single liked
+            // niche cannot fill the entire feed with the same subject.
+            val overusedTopics = servedTopicCounts
+                .filterValues { it >= TOPIC_REPEAT_SERIES }
+                .keys
+            if (overusedTopics.isNotEmpty()) {
+                val rotationFiltered = eligible.filter { key ->
+                    bucketTopTopic(buckets[key], affinities) !in overusedTopics
+                }
+                if (rotationFiltered.isNotEmpty()) eligible = rotationFiltered
+            }
 
             // Take from the creator with the most remaining Shorts first so a creator with a
             // single item is not stranded at the end next to another of its own videos.
@@ -1001,11 +1185,32 @@ class ShortsRecommendationEngine(
             val item = bucket.removeFirst()
             ordered.add(item)
 
+            val servedTopic = topicFor(item, affinities)
             if (item.channelId.isNotBlank()) lastChannelId = item.channelId
+            if (servedTopic.isNotBlank()) avoid = servedTopic
             if (bucket.isNotEmpty()) rotation.add(key) else buckets.remove(key)
         }
         return ordered
     }
+
+    /** Best-affinity keyword token of a Short, falling back to its first meaningful tag. */
+    private fun topicFor(short: ShortItem, affinities: Map<String, AffinityScoreEntity>): String {
+        val tags = extractTags(short.title)
+        if (tags.isEmpty()) return short.channelId.ifBlank { short.id }
+        return tags.maxByOrNull { affinities[tagKey(it)]?.score ?: 0.0 }?.let { it }
+            ?: tags.first()
+    }
+
+    private fun rememberServedTopic(topic: String) {
+        if (topic.isBlank()) return
+        servedTopicCounts[topic] = (servedTopicCounts[topic] ?: 0) + 1
+    }
+
+    /** Topic of a creator bucket, based on its highest-scored remaining Short. */
+    private fun bucketTopTopic(
+        bucket: ArrayDeque<ShortItem>?,
+        affinities: Map<String, AffinityScoreEntity>
+    ): String? = bucket?.firstOrNull()?.let { topicFor(it, affinities) }?.takeIf { it.isNotBlank() }
 
     // ---------------------------------------------------------------------------------------
     // Helpers

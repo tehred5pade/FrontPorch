@@ -35,18 +35,25 @@ fun YouTubeThumbnail(
     videoId: String,
     contentDescription: String,
     okHttpClient: OkHttpClient,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    thumbnailUrl: String? = null
 ) {
-    var bitmap by remember(videoId) { mutableStateOf(ThumbnailMemoryCache.get(videoId)) }
+    val resolvedVideoId = remember(videoId, thumbnailUrl) {
+        val extracted = thumbnailUrl
+            ?.let { url -> Regex("/vi/([^/]+)/").find(url)?.groupValues?.getOrNull(1) }
+        extracted?.takeIf { it.isNotBlank() } ?: videoId
+    }
 
-    LaunchedEffect(videoId) {
+    var bitmap by remember(resolvedVideoId) { mutableStateOf(ThumbnailMemoryCache.get(resolvedVideoId)) }
+
+    LaunchedEffect(resolvedVideoId) {
         if (bitmap != null) return@LaunchedEffect
 
         val loaded = withContext(Dispatchers.IO) {
             val urls = listOf(
-                "https://i.ytimg.com/vi/$videoId/hqdefault.jpg",
-                "https://i.ytimg.com/vi/$videoId/mqdefault.jpg",
-                "https://img.youtube.com/vi/$videoId/0.jpg"
+                "https://i.ytimg.com/vi/$resolvedVideoId/hqdefault.jpg",
+                "https://i.ytimg.com/vi/$resolvedVideoId/mqdefault.jpg",
+                "https://img.youtube.com/vi/$resolvedVideoId/0.jpg"
             )
             for (url in urls) {
                 val bytes = runCatching {
@@ -71,7 +78,7 @@ fun YouTubeThumbnail(
         }
 
         if (loaded != null) {
-            ThumbnailMemoryCache.put(videoId, loaded)
+            ThumbnailMemoryCache.put(resolvedVideoId, loaded)
             bitmap = loaded
         }
     }

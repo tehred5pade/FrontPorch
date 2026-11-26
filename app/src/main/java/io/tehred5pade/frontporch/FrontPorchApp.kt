@@ -223,9 +223,9 @@ suspend fun resolveShortStream(
     }
 
     val clients = listOf(
-        Triple("ANDROID_VR", "1.60.19", "28") to "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; Quest 3 Build/SQ3A.220605.009.A1) gzip",
         Triple("IOS", "20.10.4", "5") to "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)",
-        Triple("ANDROID", "20.10.38", "3") to "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US; Pixel 8 Build/UQ1A.240205.004; gzip)"
+        Triple("ANDROID", "20.10.38", "3") to "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US; Pixel 8 Build/UQ1A.240205.004; gzip)",
+        Triple("ANDROID_VR", "1.60.19", "28") to "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; Quest 3 Build/SQ3A.220605.009.A1) gzip"
     )
 
     var lastError = "Unknown error"

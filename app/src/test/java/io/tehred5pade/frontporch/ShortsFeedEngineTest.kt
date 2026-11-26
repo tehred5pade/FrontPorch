@@ -11,7 +11,7 @@ import io.tehred5pade.frontporch.data.local.SeenShortEntity
 import io.tehred5pade.frontporch.data.local.ShortFeedbackEntity
 import io.tehred5pade.frontporch.data.local.TagAffinityEntity
 import io.tehred5pade.frontporch.data.prefs.UserSettings
-import io.tehred5pade.frontporch.data.recommendation.ShortsFeedEngine
+import io.tehred5pade.frontporch.data.recommendation.ShortsRecommendationEngine
 import io.tehred5pade.frontporch.ui.models.ShortItem
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -61,7 +61,8 @@ class ShortsFeedEngineTest {
         }
 
         override suspend fun getSeen(videoId: String) = seen[videoId]
-        override suspend fun getAllSeenIds() = seen.keys.toList()
+        override suspend fun getAllSeenIds(): List<String> = seen.keys.toList()
+        override suspend fun getAllSeen(): List<SeenShortEntity> = seen.values.toList()
         override suspend fun insertSeen(seen: SeenShortEntity) {
             this.seen[seen.videoId] = seen
         }
@@ -128,14 +129,14 @@ class ShortsFeedEngineTest {
     private lateinit var dao: FakeRecommendationDao
     private lateinit var subscriptionDao: FakeSubscriptionDao
     private lateinit var source: FakeShortsSource
-    private lateinit var engine: ShortsFeedEngine
+    private lateinit var engine: ShortsRecommendationEngine
 
     @Before
     fun setUp() {
         dao = FakeRecommendationDao()
         subscriptionDao = FakeSubscriptionDao()
         source = FakeShortsSource()
-        engine = ShortsFeedEngine(
+        engine = ShortsRecommendationEngine(
             recommendationDao = dao,
             subscriptionDao = subscriptionDao,
             shortsService = source
@@ -149,7 +150,7 @@ class ShortsFeedEngineTest {
         engine.seedSubscriptions()
 
         val affinity = dao.getAffinity("channel:UC1")
-        assertEquals(ShortsFeedEngine.SUBSCRIPTION_BASELINE, affinity?.score ?: 0.0, 0.001)
+        assertEquals(ShortsRecommendationEngine.SUBSCRIPTION_BASELINE, affinity?.score ?: 0.0, 0.001)
     }
 
     @Test
@@ -162,8 +163,8 @@ class ShortsFeedEngineTest {
         )
 
         engine.setLike(short)
-        assertEquals(ShortsFeedEngine.CHANNEL_LIKE_DELTA, dao.getAffinity("channel:UC2")!!.score, 0.001)
-        assertEquals(ShortsFeedEngine.KEYWORD_LIKE_DELTA, dao.getAffinity("tag:woodworking")!!.score, 0.001)
+        assertEquals(ShortsRecommendationEngine.CHANNEL_LIKE_DELTA, dao.getAffinity("channel:UC2")!!.score, 0.001)
+        assertEquals(ShortsRecommendationEngine.KEYWORD_LIKE_DELTA, dao.getAffinity("tag:woodworking")!!.score, 0.001)
 
         engine.clearLike(short)
         assertEquals(0.0, dao.getAffinity("channel:UC2")!!.score, 0.001)
@@ -173,8 +174,8 @@ class ShortsFeedEngineTest {
         engine.setDislike(short.copy(id = "v3"))
 
         val channel = dao.getAffinity("channel:UC2")!!
-        assertEquals(ShortsFeedEngine.CHANNEL_DISLIKE_DELTA * 2, channel.score, 0.001)
-        assertEquals(ShortsFeedEngine.CHANNEL_MUTE_DISLIKES, channel.dislikeCount)
+        assertEquals(ShortsRecommendationEngine.CHANNEL_DISLIKE_DELTA * 2, channel.score, 0.001)
+        assertEquals(ShortsRecommendationEngine.CHANNEL_MUTE_DISLIKES, channel.dislikeCount)
         assertTrue(channel.muted)
     }
 
@@ -228,6 +229,57 @@ class ShortsFeedEngineTest {
         for (i in 0 until ranked.lastIndex) {
             assertNotEquals(ranked[i].channelId, ranked[i + 1].channelId)
         }
+    }
+
+    @Test
+    fun feedRotatesAwayFromSameTopicServedLast() = runBlocking {
+        subscriptionDao.subscriptions = listOf(SubscriptionEntity("UCSUB", "Sub Channel"))
+        source.channelShorts["UCSUB"] = listOf(
+            ShortItem(
+                id = "sub1",
+                title = "Harry Potter and the Chamber",
+                channelTitle = "Sub Channel",
+                channelId = "UCSUB",
+                isShortForm = true,
+                durationSeconds = 20
+            )
+        )
+
+        val firstFeed = engine.fetchNextShorts(
+            existingIds = emptySet(),
+            lastChannelId = null,
+            count = 8,
+            settings = UserSettings(),
+            visitorData = null
+        )
+        assertEquals(listOf("sub1"), firstFeed.map { it.id })
+
+        // A different-niche Short must not be served right after the Harry Potter Short, even
+        // though the creators differ. The topic guard keeps the feed out of single-niche loops.
+        val nextFeed = engine.rankUnshown(
+            items = listOf(
+                ShortItem(
+                    id = "hp2",
+                    title = "Harry Potter and the Knight",
+                    channelTitle = "HP Other",
+                    channelId = "UCHP2",
+                    isShortForm = true,
+                    durationSeconds = 20
+                ),
+                ShortItem(
+                    id = "car1",
+                    title = "Car flipping in the snow",
+                    channelTitle = "Car Ch",
+                    channelId = "UCCAR",
+                    isShortForm = true,
+                    durationSeconds = 20
+                )
+            ),
+            settings = UserSettings(),
+            firstChannelId = null
+        )
+
+        assertEquals(listOf("car1", "hp2"), nextFeed.map { it.id })
     }
 
     @Test

@@ -87,6 +87,7 @@ import io.tehred5pade.frontporch.data.sponsorblock.SponsorBlockRepository
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSegment
 import io.tehred5pade.frontporch.data.sponsorblock.SponsorSkipBehavior
 import io.tehred5pade.frontporch.service.PlaybackSessionHolder
+import io.tehred5pade.frontporch.util.resolveDownloadedMediaUri
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -788,7 +789,7 @@ fun VideoPlayerScreen(
             isLoading = false
             val t = fallbackTitle.orEmpty()
             val c = fallbackChannel.orEmpty()
-            val fileUri = runCatching { Uri.parse(localVideoPath) }.getOrNull() ?: Uri.EMPTY
+            val fileUri = resolveDownloadedMediaUri(localVideoPath)
             exoPlayer.setMediaItem(MediaItem.fromUri(fileUri))
             exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
             exoPlayer.prepare()
@@ -924,6 +925,8 @@ fun VideoPlayerScreen(
                                 settings.javaScriptEnabled = true
                                 settings.domStorageEnabled = true
                                 settings.databaseEnabled = true
+                                settings.allowFileAccess = false
+                                settings.allowContentAccess = false
                                 settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                                 settings.mediaPlaybackRequiresUserGesture = false
                                 settings.useWideViewPort = true

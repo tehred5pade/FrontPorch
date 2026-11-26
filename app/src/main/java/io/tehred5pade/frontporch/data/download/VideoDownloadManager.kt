@@ -374,7 +374,7 @@ class VideoDownloadManager(
     @Volatile
     private var newPipeReady = false
 
-    private fun ensureNewPipeInitialized(): Boolean {
+    fun ensureNewPipeInitialized(): Boolean {
         if (newPipeReady) return true
         synchronized(this) {
             if (newPipeReady) return true
@@ -454,6 +454,7 @@ class VideoDownloadManager(
         }
         val extractor = MediaExtractor()
         try {
+            Log.d("FrontPorchDownload", "Validating downloaded media file ${file.absolutePath} (${file.length()} bytes, audioOnly=$audioOnly)")
             extractor.setDataSource(file.absolutePath)
             var hasSamples = false
             val checkBuffer = java.nio.ByteBuffer.allocateDirect(1024)
@@ -464,8 +465,16 @@ class VideoDownloadManager(
                 if (!isVideo && !isAudio) continue
                 if (audioOnly && isVideo) continue
                 extractor.selectTrack(i)
-                if (extractor.readSampleData(checkBuffer, 0) >= 0 || extractor.sampleTime >= 0L) {
-                    hasSamples = true
+                Log.d("FrontPorchDownload", "Validating sample via MediaExtractor: file=${file.absolutePath} track=$i mime=$mime")
+                try {
+                    if (extractor.readSampleData(checkBuffer, 0) >= 0 || extractor.sampleTime >= 0L) {
+                        hasSamples = true
+                    }
+                } catch (e: Exception) {
+                    // The MediaExtractor JNI wrapper throws IllegalArgumentException when the
+                    // native sample read fails; keep validating the remaining tracks instead of
+                    // letting the raw native error abort the whole download.
+                    Log.e("FrontPorchDownload", "MediaExtractor sample read failed: file=${file.absolutePath} track=$i mime=$mime", e)
                 }
                 extractor.unselectTrack(i)
             }
@@ -1529,6 +1538,13 @@ class VideoDownloadManager(
                             if (e is CancellationException) throw e
                             cancellation.ensureActive()
                             lastError = e
+                            val failureMessage = lastError?.message.orEmpty()
+                            // Auth-class failures (401/403) mean the session token backing this
+                            // ranged stream is likely stale; drop the partial state so a retry
+                            // re-resolves the stream instead of replaying doomed ranges.
+                            if (failureMessage.contains("HTTP 401") || failureMessage.contains("HTTP 403")) {
+                                deletePartState(destination)
+                            }
                             if (attemptWritten > 0L) {
                                 downloaded.addAndGet(-attemptWritten)
                                 progress.report(downloaded.get().toFloat() / totalBytes, downloaded.get())
@@ -1853,7 +1869,7 @@ class VideoDownloadManager(
             if (e is CancellationException) throw e
             val topTrace = e.stackTrace.firstOrNull()?.let { "${it.className.substringAfterLast('.')}.${it.methodName}(:${it.lineNumber})" }
             val msg = e.message?.takeIf { !it.isBlank() } ?: e.cause?.message?.takeIf { !it.isBlank() } ?: topTrace ?: e.toString()
-            val errorDetails = "[Muxing] Failed: ${e.javaClass.simpleName} - $msg"
+            val errorDetails = "[Muxing] Failed: ${e.javaClass.simpleName} - $msg (out=${outMp4.absolutePath})"
             Log.e("FrontPorchDownload", errorDetails, e)
             outMp4.delete()
             videoRaw?.delete()
@@ -1888,79 +1904,10 @@ class VideoDownloadManager(
 
     private suspend fun saveToChosenFolder(sourceFile: File, displayName: String, extension: String, mimeType: String): SavedFileResult = withContext(Dispatchers.IO) {
         val targetName = "$displayName.$extension"
-        val customUri = settingsStore.getCustomFolderUri()
-
-        if (customUri != null) {
-            runCatching {
-                val docDir = DocumentFile.fromTreeUri(context, customUri)
-                if (docDir != null && docDir.canWrite()) {
-                    docDir.findFile(targetName)?.delete()
-                    val newDoc = docDir.createFile(mimeType, targetName)
-                    if (newDoc != null) {
-                        val pfd = context.contentResolver.openFileDescriptor(newDoc.uri, "rwt")
-                        if (pfd != null) {
-                            pfd.use { descriptor ->
-                                FileOutputStream(descriptor.fileDescriptor).use { out ->
-                                    sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
-                                }
-                            }
-                        } else {
-                            context.contentResolver.openOutputStream(newDoc.uri)?.use { out ->
-                                sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
-                            }
-                        }
-                        return@withContext SavedFileResult(newDoc.uri.toString(), sourceFile.length())
-                    }
-                }
-            }.onFailure { e ->
-                Log.e("FrontPorchDownload", "SAF save failed for $targetName: ${e.message}", e)
-            }
-        }
-
-        // Save via MediaStore (supports Android 10+ Scoped Storage without permission errors)
-        runCatching {
-            val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
-            val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/FrontPorch"
-
-            val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-            val selectionArgs = arrayOf(targetName, "$relativePath%")
-            runCatching { context.contentResolver.delete(collection, selection, selectionArgs) }
-
-            val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, targetName)
-                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
-            }
-
-            val itemUri = context.contentResolver.insert(collection, values)
-            if (itemUri != null) {
-                val pfd = context.contentResolver.openFileDescriptor(itemUri, "rwt")
-                if (pfd != null) {
-                    pfd.use { descriptor ->
-                        FileOutputStream(descriptor.fileDescriptor).use { out ->
-                            sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
-                        }
-                    }
-                } else {
-                    context.contentResolver.openOutputStream(itemUri)?.use { out ->
-                        sourceFile.inputStream().use { input -> input.copyTo(out, bufferSize = 256 * 1024) }
-                    }
-                }
-                values.clear()
-                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                context.contentResolver.update(itemUri, values, null, null)
-                return@withContext SavedFileResult(itemUri.toString(), sourceFile.length())
-            }
-        }.onFailure { e ->
-            Log.e("FrontPorchDownload", "MediaStore save failed for $targetName: ${e.message}", e)
-        }
-
-        // Fallback: standard file I/O to public downloads or app-specific downloads
-        val downloadsDir = runCatching {
-            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FrontPorch").apply { mkdirs() }
-        }.getOrNull()?.takeIf { (it.exists() || it.mkdirs()) && it.canWrite() }
-            ?: File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir, "FrontPorch").apply { mkdirs() }
+        val downloadsDir = File(
+            context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir,
+            "FrontPorch"
+        ).apply { mkdirs() }
 
         val targetFile = File(downloadsDir, targetName)
         sourceFile.copyTo(targetFile, overwrite = true, bufferSize = 256 * 1024)

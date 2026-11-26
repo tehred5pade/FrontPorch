@@ -38,13 +38,17 @@ fun handleVideoMenuAction(
                 putExtra(Intent.EXTRA_SUBJECT, video.title)
                 putExtra(Intent.EXTRA_TEXT, shareUrl)
             }
-            context.startActivity(Intent.createChooser(shareIntent, "Share video"))
+            val chooser = Intent.createChooser(shareIntent, "Share video").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runCatching { context.startActivity(chooser) }
         }
         VideoMenuAction.OPEN_IN_BROWSER -> {
             val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(watchUrl)).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(browserIntent)
+            runCatching { context.startActivity(browserIntent) }
+                .onFailure { Toast.makeText(context, "No app available to open link", Toast.LENGTH_SHORT).show() }
         }
     }
 }
